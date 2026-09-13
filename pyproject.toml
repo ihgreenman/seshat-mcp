@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "seshat-mcp"
+version = "0.1.0"
+description = "A persistent note store an LLM assistant can query and write cheaply"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.0", "pydantic>=2.0"]
+
+[project.scripts]
+seshat = "seshat.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/seshat"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
