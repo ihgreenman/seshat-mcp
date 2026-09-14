@@ -6,3 +6,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+eval/*.db
+eval/*.db-wal
+eval/*.db-shm
+eval/embed_cache.json
