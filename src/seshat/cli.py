@@ -14,9 +14,11 @@ import os
 import sys
 from pathlib import Path
 
+from .embeddings import DEFAULT_MODEL, EmbedderUnavailable, OllamaEmbedder
 from .server import default_db_path, help_payload, serve
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .store import DEFAULT_THETA, SeshatError, Store
+from .worker import EmbeddingWorker
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -30,12 +32,21 @@ def _parser() -> argparse.ArgumentParser:
              "Capture is once-only: links written while this is off are "
              "unrecoverable later.",
     )
+    p.add_argument(
+        "--no-embeddings", dest="embeddings", action="store_false",
+        default=os.environ.get("SESHAT_EMBEDDINGS", "1") != "0",
+        help="do not embed notes or use vector search (§6.3). Retrieval stays "
+             "FTS-only; nothing is lost, since embeddings are re-derivable.",
+    )
+    p.add_argument("--model", default=DEFAULT_MODEL, help="Ollama embedding model")
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("serve", help="run the MCP server on stdio")
     sub.add_parser("info", help="store path, counts, versions and capabilities")
     sub.add_parser("snapshots", help="capture status histogram (§6.6)")
     sub.add_parser("reindex-links", help="rebuild the derived link index (§6.5)")
+    sub.add_parser("embed", help="embed every note that needs it, now")
+    sub.add_parser("reembed", help="discard all embeddings and rebuild (model migration, §6.3)")
 
     f = sub.add_parser("fetch", help="drain the snapshot capture queue now")
     f.add_argument("--limit", type=int, default=0, help="0 means drain everything")
@@ -65,11 +76,13 @@ def main(argv: list[str] | None = None) -> int:
     path = args.db or default_db_path()
 
     if args.command == "serve":
-        serve(path, theta=args.theta, snapshots=args.snapshots)
+        serve(path, theta=args.theta, snapshots=args.snapshots,
+              embeddings=args.embeddings, model=args.model)
         return 0
 
     snaps = SnapshotStore(snapshot_path_for(path)) if args.snapshots else None
-    store = Store(path, theta=args.theta, snapshots=snaps)
+    embedder = OllamaEmbedder(model=args.model) if args.embeddings else None
+    store = Store(path, theta=args.theta, snapshots=snaps, embedder=embedder)
     try:
         if args.command == "info":
             notes = store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0]
@@ -80,10 +93,11 @@ def main(argv: list[str] | None = None) -> int:
             ).fetchone()[0]
             report = help_payload(store)
             report.update({
+                "embedding_backlog": store.embedding_backlog(),
                 "path": store.path, "notes": notes, "edges": edges,
                 "assessments": assessments, "pool": pool, "theta": store.theta,
                 "links": store.db.execute("SELECT COUNT(*) FROM link").fetchone()[0],
-                "retrieval": "fts-only",
+                "retrieval": "hybrid" if report["capabilities"]["vector"] else "fts-only",
             })
             print(json.dumps(report, indent=2))
         elif args.command == "context":
@@ -112,6 +126,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             worker = SnapshotWorker(snaps)
             print(f"captured {worker.run_once()} of {len(snaps.pending())} queued")
+        elif args.command == "embed":
+            if embedder is None:
+                print("embeddings are disabled (--no-embeddings)", file=sys.stderr)
+                return 1
+            print(f"embedded {EmbeddingWorker(store).drain()} notes; "
+                  f"{store.embedding_backlog()} still outstanding")
+        elif args.command == "reembed":
+            # Model migration is a DELETE plus a drain (§6.3) -- and embeddings
+            # are derived data, so this destroys nothing that cannot come back.
+            print(f"cleared {store.clear_embeddings()} embeddings")
+            if embedder is not None:
+                print(f"re-embedded {EmbeddingWorker(store).drain()} notes")
         elif args.command == "misses":
             rows = store.db.execute(
                 "SELECT * FROM near_miss ORDER BY hit_count DESC, first_seen LIMIT ?",
@@ -121,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
                 kind = ("corrupted" if r["candidate"]
                         else "ambiguous" if r["distance"] is not None else "FABRICATED")
                 print(f"{r['hit_count']:>4}  {kind:<10}  {r['requested']}  -> {r['candidate']}")
+    except EmbedderUnavailable as exc:
+        print(f"embedder unavailable: {exc}", file=sys.stderr)
+        print("notes remain keyword-searchable; run `seshat embed` when it is back.",
+              file=sys.stderr)
+        return 1
     except SeshatError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

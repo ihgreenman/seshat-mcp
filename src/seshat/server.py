@@ -20,7 +20,9 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from . import SPEC_VERSION, __version__
+from .embeddings import DEFAULT_MODEL, OllamaEmbedder
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
+from .worker import EmbeddingWorker
 from .store import (
     DEFAULT_EDGE_LIMIT,
     DEFAULT_LIMIT,
@@ -134,19 +136,17 @@ def capability_report(store: Store) -> dict[str, Any]:
     """§3.6. Capabilities are not optional: during incremental development a
     server legitimately implements the full tool surface with no embedder, and
     reporting a bare spec_version would overstate it."""
-    notes = store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0]
     snapshots = store.snapshots
     return {
-        "vector": False,
+        "vector": bool(store.vector_ready and store.embedder is not None),
         "checker": False,
         "snapshots": snapshots is not None,
         # Capture is live; extraction is not. Bytes are held and hashed, so
         # `thin` (§6.6) cannot yet be assessed and is always 0 -- reporting
         # that separately keeps `snapshots: true` from overstating the case.
         "snapshot_extraction": False,
-        "embedding_model": None,
-        # No embedding_meta table yet, so every note is missing from it.
-        "embedding_backlog": notes,
+        "embedding_model": store.embedder.model if store.embedder else None,
+        "embedding_backlog": store.embedding_backlog(),
         "snapshot_status": (
             snapshots.histogram()
             if snapshots is not None
@@ -281,10 +281,26 @@ def serve(
     db_path: Path | None = None,
     theta: float = DEFAULT_THETA,
     snapshots: bool = True,
+    embeddings: bool = True,
+    model: str = DEFAULT_MODEL,
 ) -> None:
     path = db_path or default_db_path()
     snapshot_store = SnapshotStore(snapshot_path_for(path)) if snapshots else None
-    store = Store(path, theta=theta, snapshots=snapshot_store)
+    embedder = OllamaEmbedder(model=model) if embeddings else None
+    store = Store(path, theta=theta, snapshots=snapshot_store, embedder=embedder)
+
+    embed_worker = None
+    if embedder is not None and store.vector_loaded:
+        # Off the write path entirely (§6.3): note() commits and returns, the
+        # worker catches up. Unembedded is a legitimate state, not an error.
+        embed_worker = EmbeddingWorker(store)
+        store._on_note_written = embed_worker.notify
+        embed_worker.start()
+        log.info("embedder: %s (%d notes to embed)", model, store.embedding_backlog())
+    elif embedder is not None:
+        log.info("sqlite-vec unavailable; retrieval is FTS-only")
+    else:
+        log.info("embeddings disabled; retrieval is FTS-only")
 
     worker = None
     if snapshot_store is not None:
@@ -298,9 +314,12 @@ def serve(
     else:
         log.info("snapshot capture: disabled -- links written now are unrecoverable later")
 
-    log.info("seshat store: %s (theta=%s, retrieval=fts-only)", path, theta)
+    retrieval = "hybrid" if (embed_worker is not None and store.vector_ready) else "fts-only"
+    log.info("seshat store: %s (theta=%s, retrieval=%s)", path, theta, retrieval)
     try:
         build_server(store).run(transport="stdio")
     finally:
         if worker is not None:
             worker.stop()
+        if embed_worker is not None:
+            embed_worker.stop()

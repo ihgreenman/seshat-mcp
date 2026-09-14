@@ -32,9 +32,11 @@ def payload(result):
 async def session(tmp_path):
     params = StdioServerParameters(
         command=sys.executable,
-        # --no-snapshots, always: these tests write notes containing URLs, and
-        # without it the capture worker would make real outbound requests.
-        args=["-m", "seshat.cli", "--db", str(tmp_path / "s.db"), "--no-snapshots", "serve"],
+        # Both switches off, always. These tests write notes containing URLs,
+        # and the default configuration would fetch them and call Ollama --
+        # real outbound traffic from a unit test suite.
+        args=["-m", "seshat.cli", "--db", str(tmp_path / "s.db"),
+              "--no-snapshots", "--no-embeddings", "serve"],
     )
     return stdio_client(params)
 
@@ -64,9 +66,9 @@ async def test_help_reports_capabilities_not_just_a_version(tmp_path):
     assert info["spec_version"] and info["software_version"]
     assert info["store_version"] >= 2
     caps = info["capabilities"]
-    assert caps["vector"] is False, "no embedder in this build -- say so"
+    assert caps["vector"] is False, "started with --no-embeddings -- say so"
     assert caps["embedding_model"] is None
-    assert caps["embedding_backlog"] == 1, "every note is missing from embedding_meta"
+    assert caps["embedding_backlog"] == 1, "the note is missing from embedding_meta"
     assert set(caps["snapshot_status"]) >= {"pending", "ok", "unreachable", "gone", "thin"}
 
 
@@ -212,7 +214,7 @@ def test_stdout_carries_only_json_rpc(tmp_path):
     })
     proc = subprocess.run(
         [sys.executable, "-m", "seshat.cli", "--db", str(tmp_path / "s.db"),
-         "--no-snapshots", "serve"],
+         "--no-snapshots", "--no-embeddings", "serve"],
         input=request + "\n", capture_output=True, text=True, timeout=30,
     )
     lines = [line for line in proc.stdout.splitlines() if line.strip()]

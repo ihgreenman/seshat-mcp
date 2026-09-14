@@ -128,3 +128,31 @@ def test_rationales_are_searchable_but_never_in_context(store, mk):
                              [{"id": a, "retained": 0.3, "why": "polyphase decomposition changed it"}])
     assert store.search_rationales("polyphase")[0]["rationale"] == "polyphase decomposition changed it"
     assert store.context("polyphase") == []
+
+
+def test_function_words_do_not_retrieve_on_their_own(store):
+    """The failure this guards, observed live: with OR expansion a single
+    function word can retrieve a document at rank 1, and RRF -- being
+    rank-based -- then treats that ranking as authoritative and can promote the
+    note above a correct semantic match."""
+    noise = store.create_note("Catastrophic cancellation in tail energy",
+                              "total minus cumsum dies when the two are nearly equal")[0]
+    wanted = store.create_note("Reciprocal rank fusion needs no score calibration",
+                               "rank-based, so incommensurable scorers are never reconciled")[0]
+
+    assert "two" not in fts_query("combining two rankings")
+    assert noise not in [h.id for h in store.context("combining two rankings")]
+    assert wanted in [h.id for h in store.context("reciprocal rank fusion")]
+
+
+def test_a_query_of_only_function_words_still_searches(store):
+    """Dropping every token would turn a real query into a recency listing,
+    which is a different answer wearing the same shape."""
+    note_id = store.create_note("counting", "one two three")[0]
+    assert fts_query("one two three") == '"one" OR "two" OR "three"'
+    assert [h.id for h in store.context("one two three")] == [note_id]
+
+
+def test_content_words_are_kept_verbatim():
+    assert fts_query("the bilinear transform") == '"bilinear" OR "transform"'
+    assert fts_query("nomic-embed-text") == '"nomic" OR "embed" OR "text"'

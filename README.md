@@ -9,10 +9,11 @@ alongside the software and store versions, which move independently (§11.1).
 `tests/test_spec_version.py` fails if the code ever claims a revision the
 document has not reached.
 
-**Status.** The full 1.1 tool surface is implemented. Retrieval is FTS5/BM25 —
-there is no embedder yet — and snapshot capture stores raw bytes without
-extraction. Both gaps are reported by `help`, not hidden: `vector: false`,
-`snapshot_extraction: false`. See [Not yet built](#not-yet-built).
+**Status.** The full 1.1 tool surface is implemented, and retrieval is hybrid:
+FTS5/BM25 and vector KNN fused with RRF. Snapshot capture stores raw bytes
+without extraction. Remaining gaps are reported by `help` rather than hidden —
+`snapshot_extraction: false`, and `vector: false` whenever the vector side is
+not actually available. See [Not yet built](#not-yet-built).
 
 ## Install
 
@@ -20,15 +21,20 @@ extraction. Both gaps are reported by `help`, not hidden: `vector: false`,
 python3 -m venv .venv && .venv/bin/pip install -e .
 ```
 
-Python ≥ 3.11. Runtime dependencies: `mcp`, `pydantic`. Nothing else — the
-store is stdlib `sqlite3`, fetching is stdlib `urllib`, and the BIP-39 wordlist
-is vendored.
+Python ≥ 3.11. Runtime dependencies: `mcp`, `pydantic`, and optionally
+`sqlite-vec` for vector search (`pip install -e '.[vector]'`). Nothing else —
+the store is stdlib `sqlite3`, both HTTP clients are stdlib `urllib`, and the
+BIP-39 wordlist is vendored.
+
+Vector search additionally wants [Ollama](https://ollama.com) with
+`ollama pull nomic-embed-text`. Both are optional at runtime: without either,
+retrieval falls back to keyword search and says so.
 
 ## Run
 
 ```sh
 seshat --db ~/notes/seshat.db serve          # MCP server on stdio
-seshat --db ~/notes/seshat.db --no-snapshots serve
+seshat --db ~/notes/seshat.db --no-snapshots --no-embeddings serve
 ```
 
 As an MCP server (`claude mcp add`, or in a config file):
@@ -65,6 +71,8 @@ seshat misses               # id lookups that failed (§6.1)
 seshat snapshots            # capture histogram (§6.6)
 seshat fetch                # drain the capture queue now
 seshat reindex-links        # rebuild the derived link index (§6.5)
+seshat embed                # embed everything outstanding, now
+seshat reembed              # discard and rebuild all embeddings (model migration)
 ```
 
 `seshat misses` classifies each failure, which is the point of the table:
@@ -97,6 +105,37 @@ an unfetched page is not.
 > someone edits the statement. Two tests assert the separation structurally —
 > the notes database has no `snapshot` table and the snapshot database has no
 > `link` table. Do not consolidate them.
+
+## Retrieval
+
+FTS5/BM25 and vector KNN run independently and fuse with reciprocal rank
+fusion, `score = Σ 1/(k + rankᵢ)` with k=60 (§6). RRF is rank-based, so BM25
+scores and cosine distances never have to be made commensurable — there is no
+invented calibration anywhere in the path.
+
+Sum, not maximum: a note both retrievers rank second beats a note one ranks
+first, which is the entire reason for running two of them.
+
+**Degradation is a first-class path, not an error** (§6.3). No `sqlite-vec`, no
+Ollama, a cold model, or simply nothing embedded yet all produce the FTS
+ranking alone — same score shape, so a caller's triage stays calibrated — and
+`help` reports `vector: false` so the degradation is visible rather than
+silently worse. A failed query embedding also puts the vector side on a 30s
+cooldown, without which every subsequent `context` would pay the timeout while
+Ollama is down.
+
+Embedding is asynchronous and off the write path (§6.3): `note()` commits and
+returns, a worker catches up. A note is keyword-findable immediately and
+semantically findable seconds later. **Unembedded is a legitimate state**, and
+the backlog is a query — a row absent from `embedding_meta`, or carrying a
+different `model`, needs embedding — which is what makes model migration a
+`DELETE` plus a drain rather than a schema change.
+
+The nomic task prefixes (`search_document:` / `search_query:`) are applied by
+two module-level functions and **a backend cannot apply them at all**: an
+`Embedder` implements only `embed(texts)` and receives fully-prefixed text.
+§6 warns the convention is easy to get wrong in exactly one code path, so there
+is exactly one code path.
 
 ## Implementation notes
 
@@ -139,7 +178,8 @@ in brackets.
 
 1. **FTS queries are OR, not AND** — recall with BM25 ranking, rather than a
    conjunctive filter that returns nothing on a five-word question. Tokens are
-   quoted, so no caller string reaches FTS5's query syntax.
+   quoted, so no caller string reaches FTS5's query syntax. Function words are
+   dropped from the expansion, for a reason found the hard way: see below.
 2. **`near_miss` distinguishes ambiguity from fabrication** within the spec's
    columns: `candidate` NULL with a non-NULL `distance` means several real ids
    were equidistant; both NULL means nothing was in range.
@@ -152,6 +192,27 @@ in brackets.
 
 `θ` defaults to 0.8 [§9.2] — a starting point with no principled basis,
 tunable with `--theta`.
+
+### One defect found by running it, and the fix
+
+Live hybrid retrieval on a five-note corpus ranked *"Catastrophic cancellation
+in tail energy"* first for the query **"combining two rankings"**, above the
+note actually about rank fusion — which the vector side had correctly ranked
+first.
+
+The cause is an interaction, not a bug in any one part. `OR` expansion lets a
+single token retrieve a document, the only matching token was **"two"**, and RRF
+is rank-blind: it cannot see that the keyword match was worthless, so a spurious
+rank-1 hit contributed exactly as much as a good one, and corroboration across
+the two retrievers then promoted the wrong note above the right one.
+
+The fix is at the source — function words are dropped from the FTS expansion,
+keeping them only when a query consists of nothing else (so "one two three"
+still finds the note that says it). All four probe queries rank correctly after
+it. Worth stating plainly: this was found on a corpus of five notes, so the
+*frequency* of the failure is unmeasured. The mechanism, though, is general —
+function word plus OR plus rank-blind fusion — and does not depend on corpus
+size.
 
 ### One spec claim this build could not verify
 
@@ -170,19 +231,19 @@ they will be implemented as specified when the embedder lands, but the word
 .venv/bin/python -m pytest
 ```
 
-126 tests, no network access. Expected values are derived independently of the
+154 tests, no network access — the embedder and the fetcher are both injected,
+and the server tests run the subprocess with `--no-snapshots --no-embeddings`
+so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins
 resolution, heads and Levenshtein distance from the spec text and imports
 nothing from `seshat`), and the load-bearing assertions have been checked by
 mutating the implementation to confirm they turn red — including the pool join,
 the max/min rule, truncation counts, silent id resolution, the store lock,
-stdout discipline, snapshot immutability, and write-path isolation.
+stdout discipline, snapshot immutability, write-path isolation, the task
+prefixes, strip-vs-index, vector degradation, and sum-vs-max fusion.
 
 ## Not yet built
 
-- **Embeddings and hybrid retrieval** [§6, §6.3] — increment 2. `context`
-  scores are already in RRF shape (`1/(k+rank)`, k=60), so the vector side
-  changes scores, not signatures.
 - **Snapshot extraction** [§6.6] — the `thin` status cannot be assessed until
   an extractor exists, and `help` reports `snapshot_extraction: false` rather
   than letting `snapshots: true` imply it.

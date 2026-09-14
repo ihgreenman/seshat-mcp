@@ -1,8 +1,9 @@
-"""SQLite storage and retrieval for seshat. Spec §5, §6, §7.1.
+"""SQLite storage and retrieval for seshat. Spec §5, §6.
 
-Increment one: FTS5 only. There is no embedding table, no Ollama dependency and
-no background worker here. `context` is therefore keyword retrieval, scored in
-the shape RRF will use once the vector side lands (§6, `_rrf`).
+Retrieval is hybrid when it can be: FTS5/BM25 and vector KNN run independently
+and fuse with RRF (§6). Every part of the vector side is optional at runtime --
+no sqlite-vec, no Ollama, or simply nothing embedded yet all degrade `context`
+to the keyword ranking alone rather than failing it (§6.3).
 """
 
 from __future__ import annotations
@@ -12,14 +13,17 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from . import ids, links
+from . import embeddings, ids, links, vectors
+from .embeddings import DEFAULT_DIM
 
 if TYPE_CHECKING:  # pragma: no cover
+    from .embeddings import Embedder
     from .snapshots import SnapshotStore
 
 log = logging.getLogger("seshat.store")
@@ -30,10 +34,15 @@ DEFAULT_THETA = 0.8
 RRF_K = 60
 """Reciprocal rank fusion constant (§6)."""
 
+VECTOR_COOLDOWN = 30.0
+"""Seconds to skip the vector side after it fails. Without this, every
+`context` call pays the embedder timeout while Ollama is down -- turning a
+graceful degradation into an unusable one."""
+
 DEFAULT_LIMIT = 20
 DEFAULT_EDGE_LIMIT = 10
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """On-disk schema version -- `store_version` in §11.1, independent of both the
 spec version and the software version."""
 
@@ -116,7 +125,22 @@ CREATE TABLE link (
 CREATE INDEX link_target ON link(target);   -- backlinks and DISTINCT target
 """
 
-MIGRATIONS: dict[int, str] = {2: MIGRATION_2}
+MIGRATION_3 = """
+-- Embedding provenance. A row's absence, or model != current, means
+-- "needs embedding". Model migration is a DELETE plus a worker drain. §6.3
+-- `note_vec` itself is NOT created here: a vec0 table in the schema would make
+-- the store unopenable without the extension, turning an optional dependency
+-- into a required one. See vectors.ensure_table.
+CREATE TABLE embedding_meta (
+  note_id     TEXT PRIMARY KEY REFERENCES note(id),
+  model       TEXT NOT NULL,
+  dim         INTEGER NOT NULL,
+  normalized  INTEGER NOT NULL,
+  embedded_at TEXT NOT NULL
+);
+"""
+
+MIGRATIONS: dict[int, str] = {2: MIGRATION_2, 3: MIGRATION_3}
 """Applied in order to reach SCHEMA_VERSION. A fresh store runs SCHEMA and then
 every migration, so a migrated store and a fresh one are byte-identical in
 structure -- which `tests/test_migration.py` checks rather than assumes."""
@@ -187,7 +211,45 @@ def _rrf(rank: int) -> float:
     return 1.0 / (RRF_K + rank)
 
 
+def fuse(rankings: Iterable[Sequence[str]], k: int = RRF_K) -> dict[str, float]:
+    """Reciprocal rank fusion over independent rankings (§6).
+
+        score(d) = sum over rankings of 1 / (k + rank(d))
+
+    Rank-based, so BM25 scores and cosine distances never have to be reconciled
+    -- which matters because they are not on comparable scales and any attempt
+    to normalise them would be an invented calibration.
+
+    A document found by both retrievers outscores one found by either alone,
+    which is the entire point of running them separately.
+    """
+    scores: dict[str, float] = {}
+    for ranking in rankings:
+        for rank, note_id in enumerate(ranking, start=1):
+            scores[note_id] = scores.get(note_id, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
 _FTS_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+
+STOPWORDS = frozenset("""
+a an the and or but if then than that this these those of in on at to from by
+for with without about into over under again further is are was were be been
+being am do does did doing have has had having i you he she it we they them
+his her its our your their what which who whom when where why how all any both
+each few more most other some such no nor not only own same so too very can
+will just should now as up down out off above below here there one two three
+""".split())
+"""Function words dropped from FTS expansion.
+
+Not tuning: with `OR` expansion every token can single-handedly retrieve a
+document, and RRF then treats that ranking as authoritative because it is
+rank-based and cannot see how weak the match was. Observed live -- the query
+"combining two rankings" matched a note on catastrophic cancellation, solely via
+"two", and fusion promoted it above the note the vector side had correctly
+ranked first. Function words carry no topical signal, so the cost of dropping
+them is nil and the cost of keeping them is a spurious rank-1 hit.
+"""
 
 
 def fts_query(text: str) -> str | None:
@@ -200,7 +262,10 @@ def fts_query(text: str) -> str | None:
     tokens = _FTS_TOKEN.findall(text)
     if not tokens:
         return None
-    return " OR ".join(f'"{t}"' for t in tokens)
+    content = [t for t in tokens if t.lower() not in STOPWORDS]
+    # A query made entirely of function words is still a query -- searching for
+    # "one two three" should find the note that says it.
+    return " OR ".join(f'"{t}"' for t in (content or tokens))
 
 
 def synchronized(method):
@@ -228,19 +293,45 @@ class Store:
         path: str | Path,
         theta: float = DEFAULT_THETA,
         snapshots: "SnapshotStore | None" = None,
+        embedder: "Embedder | None" = None,
     ):
         self.path = str(path)
         self.theta = theta
         self.snapshots = snapshots
+        self.embedder = embedder
         self._lock = threading.RLock()
         self._on_captures_queued: Any = None
+        self._on_note_written: Any = None
+        self._vector_cooldown_until = 0.0
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA busy_timeout = 5000")
+        # Optional and pre-v1, so its absence must cost nothing but quality.
+        self.vector_loaded = vectors.load_extension(self.db)
         self._ensure_schema()
+        if self.vector_loaded:
+            dim = embedder.dim if embedder else DEFAULT_DIM
+            with self.db:
+                vectors.ensure_table(self.db, dim)
+            existing = vectors.stored_dim(self.db)
+            if existing is not None and existing != dim:
+                # Refuse rather than write vectors of the wrong width into a
+                # table that will silently never match them.
+                log.warning(
+                    "note_vec holds dim %d but the embedder produces %d; "
+                    "vector search disabled. Re-embed with `seshat reembed`.",
+                    existing, dim,
+                )
+                self.vector_loaded = False
+
+    @property
+    def vector_ready(self) -> bool:
+        """Whether the vector side can be consulted right now (§6.3)."""
+        return self.vector_loaded and time.monotonic() >= self._vector_cooldown_until
 
     def close(self) -> None:
         self.db.close()
@@ -395,6 +486,8 @@ class Store:
         # Committed first, queued after: the note is safe before any capture is
         # attempted, and a snapshot failure can never fail a write (§6.3).
         self._queue_captures(note_id, captured)
+        if self._on_note_written:
+            self._on_note_written()
         return note_id, [r for r, _, _ in edges]
 
     def _queue_captures(self, note_id: str, found: Iterable[Any]) -> None:
@@ -640,38 +733,154 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows], total
 
+    def _fts_ranking(self, query: str, since: str | None, limit: int) -> list[str]:
+        params: list[Any] = [self.theta]
+        where = ["p.retained >= ?"]
+        if since:
+            where.append("n.created_at >= ?")
+            params.append(since)
+        where.append("note_fts MATCH ?")
+        params.append(query)
+        params.append(limit)
+        rows = self.db.execute(
+            f"""SELECT n.id FROM note_fts
+                JOIN note n ON n.rowid = note_fts.rowid
+                JOIN pool_retained p ON p.id = n.id
+                WHERE {' AND '.join(where)}
+                ORDER BY bm25(note_fts), n.created_at DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def _recent(self, since: str | None, limit: int) -> list[str]:
+        params: list[Any] = [self.theta]
+        clause = ""
+        if since:
+            clause = "AND n.created_at >= ?"
+            params.append(since)
+        params.append(limit)
+        rows = self.db.execute(
+            f"""SELECT n.id FROM note n JOIN pool_retained p ON p.id = n.id
+                WHERE p.retained >= ? {clause}
+                ORDER BY n.created_at DESC, n.id LIMIT ?""",
+            params,
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    def _vector_ranking(self, text: str, since: str | None, limit: int) -> list[str] | None:
+        """Semantic ranking, or None if the vector side cannot answer right now.
+
+        None is a legitimate, expected outcome (§6.3): no extension, no
+        embedder, a cold Ollama, or simply nothing embedded yet. Every one of
+        those degrades `context` to FTS rather than failing it.
+        """
+        if not self.vector_ready or self.embedder is None:
+            return None
+        try:
+            vector = embeddings.embed_query(self.embedder, text)
+        except Exception as exc:
+            log.info("vector side unavailable for this query (%s); using FTS only", exc)
+            self._vector_cooldown_until = time.monotonic() + VECTOR_COOLDOWN
+            return None
+        return vectors.search(self.db, vector, self.theta, limit, since)
+
     @synchronized
     def context(
         self, text: str = "", since: str | None = None, limit: int = DEFAULT_LIMIT
     ) -> list[Hit]:
         """Primary retrieval (§3.2). Empty text degrades to a recency listing.
 
+        Hybrid when it can be: FTS5/BM25 and vector KNN are run independently
+        and fused with RRF (§6). When the vector side cannot answer, the result
+        is the FTS ranking alone -- **worse, but never wrong, and never an
+        error** (§6.3). `help` reports which of the two is live so a caller can
+        say so rather than presenting degraded results as the best available.
+
         Pool membership is `retained >= theta` (§5.1), computed from direct
         edges only -- no path composition, so the diamond resolves without
         traversal.
         """
         query = fts_query(text)
-        params: list[Any] = [self.theta]
-        where = ["p.retained >= ?"]
-        if since:
-            where.append("n.created_at >= ?")
-            params.append(since)
-
         if query is None:
-            sql = f"""SELECT n.id, n.desc FROM note n JOIN pool_retained p ON p.id = n.id
-                      WHERE {' AND '.join(where)}
-                      ORDER BY n.created_at DESC, n.id LIMIT ?"""
-        else:
-            where.append("note_fts MATCH ?")
-            params.append(query)
-            sql = f"""SELECT n.id, n.desc FROM note_fts
-                      JOIN note n ON n.rowid = note_fts.rowid
-                      JOIN pool_retained p ON p.id = n.id
-                      WHERE {' AND '.join(where)}
-                      ORDER BY bm25(note_fts), n.created_at DESC LIMIT ?"""
-        params.append(limit)
-        rows = self.db.execute(sql, params).fetchall()
-        return [Hit(r["id"], r["desc"], _rrf(i)) for i, r in enumerate(rows, start=1)]
+            # Empty or unusable query: recency listing. There is nothing for
+            # either retriever to match on, so no fusion happens.
+            ordered = self._recent(since, limit)
+            return self._hydrate({note_id: _rrf(i) for i, note_id in enumerate(ordered, 1)}, limit)
+
+        rankings = [self._fts_ranking(query, since, limit)]
+        semantic = self._vector_ranking(text, since, limit)
+        if semantic is not None:
+            rankings.append(semantic)
+        return self._hydrate(fuse(rankings), limit)
+
+    def _hydrate(self, scores: dict[str, float], limit: int) -> list[Hit]:
+        """Attach descriptions to scored ids, best first."""
+        if not scores:
+            return []
+        ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        descs = dict(
+            self.db.execute(
+                f"SELECT id, desc FROM note WHERE id IN ({','.join('?' * len(ranked))})",
+                [note_id for note_id, _ in ranked],
+            ).fetchall()
+        )
+        return [Hit(note_id, descs[note_id], score) for note_id, score in ranked]
+
+    # ----------------------------------------------------------- embedding
+
+    def needs_embedding(self, limit: int = 64) -> list[tuple[str, str, str]]:
+        """Notes with no current embedding (§6.3).
+
+        The queue is a query, not a table: a row's absence from
+        `embedding_meta`, or a `model` that is not the current one, means
+        "needs embedding". That is what makes model migration a DELETE plus a
+        drain rather than a schema change.
+        """
+        model = self.embedder.model if self.embedder else ""
+        rows = self.db.execute(
+            """SELECT n.id, n.desc, n.text FROM note n
+               LEFT JOIN embedding_meta e ON e.note_id = n.id
+               WHERE e.note_id IS NULL OR e.model != ?
+               ORDER BY n.created_at LIMIT ?""",
+            (model, limit),
+        ).fetchall()
+        return [(r["id"], r["desc"], r["text"]) for r in rows]
+
+    def embedding_backlog(self) -> int:
+        model = self.embedder.model if self.embedder else ""
+        return self.db.execute(
+            """SELECT COUNT(*) FROM note n LEFT JOIN embedding_meta e ON e.note_id = n.id
+               WHERE e.note_id IS NULL OR e.model != ?""",
+            (model,),
+        ).fetchone()[0]
+
+    @synchronized
+    def store_embedding(self, note_id: str, vector: Sequence[float]) -> None:
+        from .embeddings import l2_norm
+
+        if not self.vector_ready:
+            return
+        normalized = abs(l2_norm(vector) - 1.0) < 1e-3
+        with self.db:
+            vectors.upsert(self.db, note_id, vector)
+            self.db.execute(
+                """INSERT INTO embedding_meta(note_id, model, dim, normalized, embedded_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(note_id) DO UPDATE SET
+                     model = excluded.model, dim = excluded.dim,
+                     normalized = excluded.normalized, embedded_at = excluded.embedded_at""",
+                (note_id, self.embedder.model, len(vector), int(normalized), now()),
+            )
+
+    @synchronized
+    def clear_embeddings(self) -> int:
+        """Model migration (§6.3): drop provenance, let the worker drain."""
+        count = self.db.execute("SELECT COUNT(*) FROM embedding_meta").fetchone()[0]
+        with self.db:
+            self.db.execute("DELETE FROM embedding_meta")
+            if self.vector_ready:
+                self.db.execute("DELETE FROM note_vec")
+        return count
 
     @synchronized
     def search_rationales(self, text: str, limit: int = DEFAULT_LIMIT) -> list[dict[str, Any]]:

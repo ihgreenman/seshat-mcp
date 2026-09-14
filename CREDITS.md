@@ -19,6 +19,13 @@ this list rather than the EFF diceware lists.
 - **`mcp`** — the official Model Context Protocol Python SDK, by Anthropic. MIT.
 - **`pydantic`** — Samuel Colvin and contributors. MIT.
 
+Optional:
+
+- **`sqlite-vec`** — Alex Garcia. MIT OR Apache-2.0. Vector search; without it
+  retrieval falls back to FTS5.
+- **`nomic-embed-text`** — Nomic AI, served via Ollama. Apache-2.0. Not
+  vendored or redistributed here; pulled by the user.
+
 ## Licensing
 
 seshat-mcp is © 2026 Ian Greenhoe and licensed under the MIT License; see
