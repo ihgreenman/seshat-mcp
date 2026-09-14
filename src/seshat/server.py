@@ -1,7 +1,8 @@
-"""MCP server: the five tools of spec §3.
+"""MCP server: the six tools of spec §3 -- five data operations plus `help`.
 
-Increment one is FTS-only, so `context` is keyword retrieval. The tool surface
-is exactly the spec's; the vector side changes scores, not signatures.
+Retrieval is FTS-only for now, so `context` is keyword search; `help` reports
+that honestly via `capabilities.vector`. The tool surface is exactly the
+spec's, and the vector side will change scores rather than signatures.
 """
 
 from __future__ import annotations
@@ -18,7 +19,16 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
-from .store import DEFAULT_EDGE_LIMIT, DEFAULT_LIMIT, DEFAULT_THETA, SeshatError, Store
+from . import SPEC_VERSION, __version__
+from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
+from .store import (
+    DEFAULT_EDGE_LIMIT,
+    DEFAULT_LIMIT,
+    DEFAULT_THETA,
+    SCHEMA_VERSION,
+    SeshatError,
+    Store,
+)
 
 # Nothing but JSON-RPC on stdout. A stray print on the stdio transport surfaces
 # as a malformed protocol frame and reads like an SDK bug, so the root logger is
@@ -57,14 +67,20 @@ results are in the list because they matched something, not because they are
 relevant; triage on the score."""
 
 READ_DESCRIPTION = """\
-Read a note in full, with its supersession edges.
+Read a note in full, with its supersession edges and its references.
 
 Always check `superseded_by` and `heads` before acting on the body: an id you
 are holding from earlier in the conversation may since have been superseded or
 retracted. `heads` gives the current version(s) directly.
 
-`supersedes_total` / `superseded_by_total` are counts BEFORE truncation to
-`edge_limit`. If a total exceeds the list length, you are not seeing all of it."""
+`supersedes_total` / `superseded_by_total` / `backlinks_total` are counts BEFORE
+truncation to `edge_limit`. If a total exceeds the list length, you are not
+seeing all of it -- and a hub note is exactly the case that overflows.
+
+`links` are references found in this note's text; `backlinks` are notes whose
+text points at this one, which is the direction you cannot discover by reading.
+`with_sources=True` adds the preserved content of those links -- verbose, so ask
+for it only when you need to check what a source actually said."""
 
 SUPERSEDES_DESCRIPTION = """\
 Record, after the fact, that one existing note supersedes another.
@@ -73,6 +89,18 @@ Use this when you realise a note you wrote earlier invalidates or extends an
 older one. Called on a pair that already has an edge, it records a
 RE-ASSESSMENT of `retained` rather than failing -- the old score is kept in
 history. Edges that would make the graph cyclic are rejected."""
+
+HELP_DESCRIPTION = """\
+Report what this server actually is: which revision of the seshat spec it
+implements, its own version, the schema version of the open store, and which
+capabilities are live.
+
+Check `capabilities` before trusting retrieval quality. `vector: false` or a
+nonzero `embedding_backlog` means `context` is currently keyword-weighted, and
+you can say so rather than presenting worse results as if they were the best
+available. `snapshot_status` is a histogram rather than a counter because a
+permanently failed capture has already left the queue -- a bare backlog would
+read zero while the data is missing."""
 
 CHAIN_DESCRIPTION = """\
 Return the ancestor and descendant closure of a note: how a belief got here and
@@ -100,6 +128,42 @@ def reported(fn):
             raise ToolError(str(exc)) from exc
 
     return wrapper
+
+
+def capability_report(store: Store) -> dict[str, Any]:
+    """§3.6. Capabilities are not optional: during incremental development a
+    server legitimately implements the full tool surface with no embedder, and
+    reporting a bare spec_version would overstate it."""
+    notes = store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0]
+    snapshots = store.snapshots
+    return {
+        "vector": False,
+        "checker": False,
+        "snapshots": snapshots is not None,
+        # Capture is live; extraction is not. Bytes are held and hashed, so
+        # `thin` (§6.6) cannot yet be assessed and is always 0 -- reporting
+        # that separately keeps `snapshots: true` from overstating the case.
+        "snapshot_extraction": False,
+        "embedding_model": None,
+        # No embedding_meta table yet, so every note is missing from it.
+        "embedding_backlog": notes,
+        "snapshot_status": (
+            snapshots.histogram()
+            if snapshots is not None
+            else {"pending": 0, "ok": 0, "unreachable": 0, "gone": 0, "thin": 0}
+        ),
+    }
+
+
+def help_payload(store: Store) -> dict[str, Any]:
+    meta = store.meta()
+    return {
+        "spec_version": SPEC_VERSION,
+        "software_version": __version__,
+        "store_version": int(meta.get("store_version", SCHEMA_VERSION)),
+        "created_under_spec": meta.get("created_under_spec"),
+        "capabilities": capability_report(store),
+    }
 
 
 def default_db_path() -> Path:
@@ -160,12 +224,18 @@ def build_server(store: Store) -> MCPServer:
     def read_tool(
         id: Annotated[str, Field(description="Note id: four hyphenated words.")],
         edge_limit: Annotated[
-            int, Field(description="Max edges listed per direction.", ge=1)
+            int, Field(description="Max edges and backlinks listed.", ge=1)
         ] = DEFAULT_EDGE_LIMIT,
+        with_sources: Annotated[
+            bool,
+            Field(description="Include preserved content of this note's links. Verbose."),
+        ] = False,
     ) -> dict[str, Any]:
-        record = asdict(store.read(id, edge_limit))
+        record = asdict(store.read(id, edge_limit, with_sources))
         if record["resolved_by_proximity"] is None:
             del record["resolved_by_proximity"]
+        if record["sources"] is None:
+            del record["sources"]
         return record
 
     @server.tool(name="supersedes", description=SUPERSEDES_DESCRIPTION)
@@ -193,6 +263,11 @@ def build_server(store: Store) -> MCPServer:
             del result["resolved_by_proximity"]
         return result
 
+    @server.tool(name="help", description=HELP_DESCRIPTION)
+    @reported
+    def help_tool() -> dict[str, Any]:
+        return help_payload(store)
+
     return server
 
 
@@ -202,8 +277,30 @@ def main(argv: list[str] | None = None) -> int:
     return cli_main(argv)
 
 
-def serve(db_path: Path | None = None, theta: float = DEFAULT_THETA) -> None:
+def serve(
+    db_path: Path | None = None,
+    theta: float = DEFAULT_THETA,
+    snapshots: bool = True,
+) -> None:
     path = db_path or default_db_path()
-    store = Store(path, theta=theta)
-    log.info("seshat store: %s (theta=%s, fts-only)", path, theta)
-    build_server(store).run(transport="stdio")
+    snapshot_store = SnapshotStore(snapshot_path_for(path)) if snapshots else None
+    store = Store(path, theta=theta, snapshots=snapshot_store)
+
+    worker = None
+    if snapshot_store is not None:
+        # Capture runs off the write path entirely (§6.3). The store only ever
+        # nudges the worker; it never waits for it.
+        worker = SnapshotWorker(snapshot_store)
+        store._on_captures_queued = worker.notify
+        worker.start()
+        log.info("snapshot capture: %s (%d queued)",
+                 snapshot_store.path, len(snapshot_store.pending()))
+    else:
+        log.info("snapshot capture: disabled -- links written now are unrecoverable later")
+
+    log.info("seshat store: %s (theta=%s, retrieval=fts-only)", path, theta)
+    try:
+        build_server(store).run(transport="stdio")
+    finally:
+        if worker is not None:
+            worker.stop()

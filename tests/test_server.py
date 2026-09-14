@@ -32,19 +32,63 @@ def payload(result):
 async def session(tmp_path):
     params = StdioServerParameters(
         command=sys.executable,
-        args=["-m", "seshat.cli", "--db", str(tmp_path / "s.db"), "serve"],
+        # --no-snapshots, always: these tests write notes containing URLs, and
+        # without it the capture worker would make real outbound requests.
+        args=["-m", "seshat.cli", "--db", str(tmp_path / "s.db"), "--no-snapshots", "serve"],
     )
     return stdio_client(params)
 
 
-async def test_tool_surface_is_exactly_five_tools(tmp_path):
-    """§3: 'Five tools. This is the whole interface.' Every tool costs context
-    on every turn, which is why the checker is a CLI subcommand (§7)."""
+async def test_tool_surface_is_exactly_six_tools(tmp_path):
+    """§3 (spec 1.1): five data operations plus `help`. Every tool costs context
+    on every turn, which is why the checker stays a CLI subcommand (§7) and why
+    `help` had to justify itself (§3.6)."""
     async with await session(tmp_path) as (read, write):
         async with ClientSession(read, write) as client:
             await client.initialize()
             tools = await client.list_tools()
-    assert {t.name for t in tools.tools} == {"note", "context", "read", "supersedes", "chain"}
+    assert {t.name for t in tools.tools} == {
+        "note", "context", "read", "supersedes", "chain", "help"
+    }
+
+
+async def test_help_reports_capabilities_not_just_a_version(tmp_path):
+    """§3.6: a server legitimately implements the full surface with no embedder,
+    and a bare spec_version would overstate it."""
+    async with await session(tmp_path) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            await client.call_tool("note", {"desc": "a note", "text": "body"})
+            info = payload(await client.call_tool("help", {}))
+
+    assert info["spec_version"] and info["software_version"]
+    assert info["store_version"] >= 2
+    caps = info["capabilities"]
+    assert caps["vector"] is False, "no embedder in this build -- say so"
+    assert caps["embedding_model"] is None
+    assert caps["embedding_backlog"] == 1, "every note is missing from embedding_meta"
+    assert set(caps["snapshot_status"]) >= {"pending", "ok", "unreachable", "gone", "thin"}
+
+
+async def test_read_surfaces_links_and_backlinks(tmp_path):
+    """§3.3: backlinks are the higher-value direction, and undiscoverable by
+    reading any of the notes involved."""
+    async with await session(tmp_path) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            hub = payload(await client.call_tool("note", {
+                "desc": "the anchor finding", "text": "see https://example.com/paper",
+            }))["id"]
+            for i in range(2):
+                await client.call_tool("note", {
+                    "desc": f"follow-up {i}", "text": f"builds on {hub}",
+                })
+            record = payload(await client.call_tool("read", {"id": hub}))
+
+    assert [l["target"] for l in record["links"]] == ["https://example.com/paper"]
+    assert record["backlinks_total"] == 2
+    assert len(record["backlinks"]) == 2
+    assert "sources" not in record, "preserved content is opt-in"
 
 
 async def test_note_description_carries_the_desc_guidance(tmp_path):
@@ -167,7 +211,8 @@ def test_stdout_carries_only_json_rpc(tmp_path):
         },
     })
     proc = subprocess.run(
-        [sys.executable, "-m", "seshat.cli", "--db", str(tmp_path / "s.db"), "serve"],
+        [sys.executable, "-m", "seshat.cli", "--db", str(tmp_path / "s.db"),
+         "--no-snapshots", "serve"],
         input=request + "\n", capture_output=True, text=True, timeout=30,
     )
     lines = [line for line in proc.stdout.splitlines() if line.strip()]

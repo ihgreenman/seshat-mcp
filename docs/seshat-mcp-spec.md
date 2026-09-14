@@ -5,18 +5,20 @@ Distribution name `seshat-mcp`; CLI and MCP server identifier both `seshat`.
 Note that `seshat` is taken on crates.io (a Matrix event indexer), which
 matters only if the implementation goes to Rust.
 
-**Spec version:** 1.0. Every revision gets an explicit version number here, and
-the implementation records the version it was built against (`seshat info`).
-Version skew — code citing one version while the document has moved several
-ahead — is the failure mode this line exists to prevent.
+**Spec version: 1.1.** See §11 for versioning discipline and history.
 
-**Status:** design complete, unimplemented. Nothing here has been built or tested.
+**Status:** 1.1 handed off to implementation. All changes from 1.0 are
+additive — no signature removed, no return shape narrowed, no migration
+required. Work completed against 1.0 remains correct.
 
 **Provenance:** this design emerged from a design conversation between Ian Greenhoe
 and Claude (Opus 5), September 2026. Decisions and their rationale are recorded below;
 open questions are recorded as open rather than resolved by fiat.
 
-**License intent:** MIT.
+**Copyright © 2026 Ian Greenhoe.** Licensed under the MIT License —
+attribution required. The copyright and permission notice must be preserved
+in copies and in substantial portions of this document and of any
+implementation derived from it.
 
 ---
 
@@ -76,7 +78,7 @@ in the *new* note is a different quantity and is not represented here.
 
 ## 3. Tool surface
 
-Five tools. This is the whole interface.
+Six tools: five data operations and `help`. This is the whole interface.
 
 ### 3.1 `note(desc, text, supersedes=[]) -> id`
 
@@ -114,7 +116,7 @@ Returns `desc`, never bodies. Bodies are paid for individually via `read`.
 **Pool membership is governed by `retained` (§5.1)** — the mechanism that
 keeps additive supersession from silently deleting correct information.
 
-### 3.3 `read(id, edge_limit=N) -> record`
+### 3.3 `read(id, edge_limit=N, with_sources=False) -> record`
 
 Returns the full record, not just the body:
 
@@ -129,6 +131,10 @@ Returns the full record, not just the body:
 | `superseded_by_total` | count before truncation |
 | `heads` | set of current head ids reachable from this note |
 | `resolved_by_proximity` | present only on a near-miss resolution; see §6.1 |
+| `links` | outbound references extracted from this note's text — `(kind, target, label)` (§6.5) |
+| `backlinks` | notes whose text references this one — `(id, desc)`, truncated to `edge_limit` |
+| `backlinks_total` | count before truncation |
+| `sources` | snapshots for this note's links; only when `with_sources` (§6.6) |
 
 `superseded_by` is not optional. Ids leak forward within a conversation; a
 reader will hold an id from many turns earlier and act on it. A `read` that
@@ -138,7 +144,9 @@ default behaviour.
 **Truncation must be visible.** The `_total` counts are not optional: a
 reader shown five of twelve supersessions will conclude the note absorbed
 five things, which violates priority 2 more cheaply than almost anything else
-in the design.
+in the design. The same applies to `backlinks`, where a hub note is exactly
+the case that overflows — a truncated list without its count reports a hub as
+a leaf.
 
 Expected degree distribution is mild. `superseded_by` is ~0 for active notes
 and ~1 otherwise — it exceeds 1 only by accident, when something already
@@ -146,6 +154,17 @@ superseded is superseded again. `supersedes` is the merge direction and is
 the one that can legitimately grow, since consolidating scattered notes into
 one is the recommended response to §8. Truncation order within a list is
 unresolved; `retained` descending is the current guess.
+
+**Backlinks are not optional.** Outbound references are visible by reading the
+note; inbound ones are invisible without a reverse index, and they are the
+higher-value direction — a note six later notes point at is a hub, and that is
+undiscoverable by reading any of the seven. Storing reference edges without
+surfacing them would leave the connections in the data and the reconstruction
+work with the reader, which is the failure this design exists to avoid.
+
+Reference edges stay out of `chain` (§3.5). Mixing "revision of" with "related
+to" in one traversal blurs the distinction that makes supersession mean
+anything.
 
 `heads` is returned directly to save round trips — without it, walking
 A←B←C from A costs two extra calls, and the likely outcome is that the
@@ -174,6 +193,59 @@ Returns the ancestor and descendant closure of a note.
   assessment only; full assessment history on request
 
 **Does not aggregate `retained` along paths.** See §5.3.
+
+### 3.6 `help() -> {versions, capabilities}`
+
+Reports what this server actually is. Six tools rather than five; justified
+because it is not a data operation and because everything else in the surface
+is meaningless without knowing which contract it honours.
+
+| field | notes |
+|---|---|
+| `spec_version` | which revision of *this document* the server implements |
+| `software_version` | the implementation's own semver |
+| `store_version` | schema version of the open database (§11.2) |
+| `capabilities` | see below |
+
+**Capabilities are not optional.** During incremental development a server
+legitimately implements the full 1.1 tool surface with no embedder — see the
+build order in §11.3 — and reporting a bare `spec_version` would overstate it.
+At minimum:
+
+```json
+{ "vector": false, "checker": false, "snapshots": false,
+  "embedding_model": null, "embedding_backlog": 0,
+  "snapshot_status": { "pending": 0, "ok": 0,
+                       "unreachable": 0, "gone": 0, "thin": 0 } }
+```
+
+`embedding_backlog` is the count of rows missing from `embedding_meta`. A
+caller seeing a nonzero backlog knows `context` is currently FTS-weighted and
+can say so rather than silently returning worse results.
+
+**Snapshots need a histogram, not a counter, and the asymmetry is the point.**
+A backlog counts *pending* work. A fetch that failed permanently has already
+left the backlog, so a bare counter reads zero while the data is missing —
+which is exactly the silent failure the preservation model exists to prevent.
+Data that silently fails preservation is not data that can be relied on.
+
+The three failure states differ in remediation, which is why they are not
+collapsed:
+
+- `unreachable` — transient; retryable.
+- `gone` — the target was already dead at capture. Permanent, and itself
+  information.
+- `thin` — extraction yielded implausibly little (§6.6). **Needs human
+  attention while manual recovery is still possible**, which is a deadline the
+  other two do not have.
+
+Embedding gets only a counter because embedding failures are local,
+deterministic, and always recoverable by re-running. Snapshot failures often
+are not. Same async shape, opposite permanence.
+
+`help` returns versions and capabilities only — not tool documentation. Tool
+descriptions already carry that, and duplicating them costs context on a call
+whose whole purpose is cheapness.
 
 ---
 
@@ -336,6 +408,13 @@ already been overwritten.
 SQLite, single file. Schema sketch:
 
 ```sql
+-- Store identity. Written at creation, bumped only on migration. §11.2
+CREATE TABLE meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+-- rows: store_version, created_under_spec, created_at
+
 CREATE TABLE note (
   id          TEXT PRIMARY KEY,   -- four BIP-39 words, hyphenated. §6.1
   desc        TEXT NOT NULL,
@@ -377,6 +456,32 @@ CREATE TABLE embedding_meta (
   dim         INTEGER NOT NULL,
   normalized  INTEGER NOT NULL,
   embedded_at TEXT NOT NULL
+);
+
+-- Derived index over note text. Rebuildable, disposable. §6.5
+CREATE TABLE link (
+  note_id  TEXT NOT NULL REFERENCES note(id),
+  kind     TEXT NOT NULL,         -- 'url' | 'hash' | 'note'
+  target   TEXT NOT NULL,
+  label    TEXT,                  -- markdown anchor text, if any
+  PRIMARY KEY (note_id, kind, target)
+);
+
+-- A witness: what the target said when this note was written. Immutable.
+-- Same key as `link`, opposite recoverability. NEVER dropped by an
+-- extraction rebuild. Lives in a separate database file. §6.6
+CREATE TABLE snapshot (
+  note_id       TEXT NOT NULL,
+  target        TEXT NOT NULL,
+  captured_at   TEXT NOT NULL,
+  status        TEXT NOT NULL,    -- 'ok' | 'gone' | 'unreachable' | 'thin'
+  title         TEXT,
+  text          TEXT,             -- extracted, truncated to the cap
+  full_hash     TEXT,             -- over the COMPLETE extraction, not `text`
+  full_length   INTEGER,
+  raw_length    INTEGER,
+  extraction    TEXT,             -- extractor name/version
+  PRIMARY KEY (note_id, target)
 );
 
 -- Lookups that missed. §6.1
@@ -516,7 +621,136 @@ rather than failing when the vector side is cold.
 This also makes model migration free: clear `embedding_meta`, let the worker
 drain.
 
-### 6.4 Other
+### 6.4 Note text is markdown by convention
+
+Notes are authored in markdown, and CommonMark is the reference dialect for
+extraction (§6.5). **This is a convention, not a contract.** The store never
+parses a note to decide whether to accept it — a write that fails over an
+unbalanced bracket would violate priority 1 outright. Non-conforming text is
+stored verbatim and is never an error.
+
+Two consequences for the pipeline:
+
+- **Embed stripped, index raw.** Markdown syntax contributes tokens that are
+  semantic noise — URL fragments especially — so strip markup before
+  embedding. FTS5 indexes the raw text, because searching for a
+  half-remembered URL is a real query. Easy to get backwards.
+- **`desc` is plain text.** It is a single-line recognition handle shown in
+  list context (§4); formatting there is noise rather than structure.
+
+### 6.5 External references
+
+**Link text is canonical; the `link` table is a derived index.**
+
+The rejected alternative is a `links=[...]` argument on `note()`. It fails the
+same way a separate `supersedes` call would: when an author has a URL they put
+it in the prose, because that is where it belongs in a sentence. The argument
+would be populated inconsistently, producing a partial index that looks
+authoritative — worse than none — and it adds weight to the write path against
+priority 1.
+
+It is also the branch that is genuinely hard to reverse. Links living *only*
+in a table, later wanted inline, would require rewriting note text, which
+immutability forbids. You would end up superseding notes for data-migration
+reasons, polluting the supersession graph with edges recording no change in
+belief.
+
+Derived extraction has none of that. Changing the extraction rules is a
+re-run, not a migration. It is also the third instance of a shape already
+committed to twice: FTS5 in `content='note'` mode, and `embedding_meta`, are
+both mutable derived data over immutable rows.
+
+**Extraction rules**, in decreasing confidence:
+
+- **URLs** — markdown `[label](url)` preferred so the anchor text is captured;
+  bare URLs also extracted.
+- **Content hashes** — §12 already has notes referencing external artifacts by
+  hash. This makes that queryable.
+- **Internal references** — a bare four-word BIP-39 id in note text is a link
+  to another note. The pattern is distinctive enough to detect without any
+  markup, so no `[[wiki]]` extension is needed. Semantically an associative
+  reference, *not* supersession; the model otherwise has no place for one.
+- **Bare filesystem paths** — not extracted. Too many false positives, and
+  machine-local anyway.
+
+**Skip fenced code blocks.** A URL in a code sample is an example, not a
+reference. This is the direct payoff of §6.4.
+
+Link checking pulls `SELECT DISTINCT target FROM link`, so per-note
+duplication costs nothing at read. Duplication would only hurt on write-back,
+which is why mutable state lives in `source` (§6.6) rather than here.
+
+### 6.6 Snapshots
+
+A snapshot records **what the target said when a given note was written**. It
+is keyed `(note_id, target)` and is immutable, exactly like the note it
+belongs to.
+
+**Why per-note and not per-target.** A per-target row would track *current
+state*, and it would have been the only thing in this design that did —
+everything else is historical by construction, which is the reason the store
+is append-only at all. Keyed per-note-at-time-of-writing, a snapshot becomes a
+witness to the state of the world at the moment a belief formed. Note and
+snapshot seal together; superseding the note leaves its witness intact, which
+is correct, because the old belief was formed against the old page.
+
+**Drift becomes a query, not a job.** Two notes citing the same target a year
+apart yield two snapshots, and comparing them *is* the drift test — over your
+own reading history rather than against the live web. There is consequently
+**no link checker**: the content is already held, and if the target
+disappears, it disappears. Rot stops being a threat model.
+
+This also retires the network concern. Fetching happens once, at capture, and
+never again. There is no recurring outbound traffic and no ongoing disclosure
+of what is being read. Public archive submission would publish the URL and
+remains opt-in per note, off by default.
+
+**`link` and `snapshot` share a key and stay separate anyway.** `link` is
+regenerable from note text in seconds; a snapshot is gone forever if dropped.
+
+> **The extraction rebuild must never touch `snapshot`.** "Drop and
+> re-extract" is the natural way to regenerate a derived index, and applying it
+> to the wrong table destroys the only data in the system that cannot be
+> recovered. This is the sharpest edge in the design and it is a two-line
+> mistake. Keeping the tables structurally separate is what keeps
+> `DELETE FROM link` safe.
+
+**Mechanics:**
+
+- **Asynchronous, per §6.3.** `note()` never blocks on a fetch.
+- **A separate queue from embedding.** Both are async, but they fail
+  differently: embedding is local, fast, and fails atomically; fetching is
+  network-bound, slow, and hangs. One stalled request must not block the
+  embedding backlog.
+- **Hash the full extraction, store the truncated copy.** A 64k cap covers
+  articles comfortably; long PDFs, API references, and long comment threads do
+  not fit. `full_hash` is computed over the complete extraction and
+  `full_length` records what was cut, so truncation is visible and
+  cross-snapshot comparison still works when both copies were trimmed. Storing
+  raw HTML would become the document corpus §12 excludes; stripping the
+  advertising, tracking, and decoration leaves something far smaller than the
+  page it came from.
+- **Separate database file.** Snapshots live outside the notes store, which
+  stays small and portable.
+- **A target already dead at capture** is information: record `status='gone'`
+  rather than retrying indefinitely.
+
+**Capture-once makes extraction failure permanent.** This is the real cost of
+the model. Under periodic re-checking a bad parse could be redone; here, if
+the extractor chokes on a JS-rendered page or a paywall interstitial, the
+mangled text is what exists forever — and the page may be gone. Record
+`extraction` and `raw_length`, and flag low-yield results at capture time: a
+200 response yielding 200 characters is a failed parse, not a short article,
+and it should surface as `status='thin'` **while manual recovery is still
+possible**.
+
+**Verification is adjacency, not a pass.** "Does the extracted text actually
+support what the note claims" is a semantic judgement, not a structural check,
+and belongs nowhere in §7. Make it answerable on demand instead:
+`read(id, with_sources=False)`, opt-in because preserved text would otherwise
+wreck every return.
+
+### 6.7 Other
 
 **License note:** `sqlite-vec` is MIT OR Apache-2.0 and pre-v1 (v0.1.7,
 March 2026; expect breaking changes). At this corpus size, brute-force KNN
@@ -550,6 +784,9 @@ validate `retained`.
 | Orphaned retraction | A is retracted, but some descendant asserting A at high `retained` is itself un-superseded | review — §5.4, the follow-up you owe |
 | Dead justification | A is in the pool only by virtue of an edge to B, and B is itself retracted | review — specific to max |
 | Double retraction | A retracted by B, B retracted by C | review — is A back? context-dependent by nature; flagging is the whole job |
+| Thin snapshot | a note's snapshot has `status='thin'` | review — **time-sensitive**; the target may still be live (§6.6) |
+| Missing snapshot | a `link` row of kind `url` with no corresponding `snapshot` row and no pending fetch | error — preservation failed silently |
+| Dangling internal link | a `link` of kind `note` whose target id does not exist | review — likely a fabricated or corrupted id (§6.1) |
 
 *Orphaned retraction* is the highest-value check in the list: it is the
 mechanical consequence of choosing max, and without it §5.4's non-locality
@@ -600,6 +837,13 @@ this document. Observations that seem robust:
 - Salience is not knowable at write time. Whether a note matters depends on
   what happens afterward. The store must support retroactive revaluation —
   which supersession with `retained = 0.0` partly provides.
+- **Inbound reference count is a retroactive salience measure**, and the only
+  one the design currently has. It accrues from what was actually used later
+  rather than from a judgement at write time, which is exactly the property
+  the previous point says is needed. It does not solve pruning — a note may
+  matter enormously and be referenced by nothing — but it is a real signal,
+  already present in the `link` table, and worth looking at before inventing
+  anything more elaborate.
 - The only mitigation with a clear mechanism is keeping the store small
   enough to be read in full, periodically.
 - An open loop is a note nothing has superseded. A query for old,
@@ -648,9 +892,155 @@ Recommend deferring any automated pruning until real usage data exists.
 
 ---
 
-## 10. Explicitly out of scope
+## 10. Review interface
 
-- Document/corpus indexing. Notes reference external artifacts by hash;
-  managing those artifacts is a separate system that may never be needed.
-- Multi-user access, auth, remote transport. Local stdio, single user.
+A local web UI, served by a subcommand of the same binary. Not an MCP tool
+surface — it adds nothing to §3 — and not part of the first three increments
+(§11.3). Increment 4.
+
+**Localhost only.** Binds 127.0.0.1, no authentication, no remote access.
+Making it network-reachable is out of scope (§12); it would demand an auth
+model this tool has no business owning.
+
+### 10.1 Primary function: reading the store
+
+Priority 3 holds that the store must stay small enough to be read in full, and
+§8 concedes that periodic full reading is the only growth mitigation with a
+mechanism behind it. Nobody does that against a SQLite CLI. A browse view over
+notes, supersession chains, and snapshots is what makes the one unsolved
+problem in this design tractable in practice. Failure triage (§10.2) is the
+secondary function, not the reason the interface exists.
+
+### 10.2 Failure triage
+
+Surfaces what `help`'s `snapshot_status` histogram counts and §7.1's checker
+rows locate. Permitted repairs:
+
+- **Paste content** for `thin`, `unreachable`, or auth-blocked targets.
+- **Retry** a transient `unreachable`.
+- **Acknowledge** a `gone` target, so it stops appearing as actionable.
+
+**Credentials are not the answer; content is.** The obvious design — let the
+user supply credentials so the fetcher can get past a paywall or a login — is
+the wrong shape. It would make seshat a credential store, demanding encryption
+at rest, key management, and rotation, with plaintext in an MCP subprocess
+config. The user is already authenticated and already looking at the page. A
+paste box clears the whole paywall/SSO/SPA class of failures and seshat never
+handles a secret.
+
+A browser extension is the better long-term shape for this — one click on the
+page already open and already authenticated, capturing the DOM directly. Same
+principle as the paste box with the friction removed, and it handles SPAs and
+paywalls structurally. Well past increment 4.
+
+Pasted snapshots record `extraction='manual'`. They are witnesses, but
+human-mediated ones, and the distinction must survive in the data rather than
+becoming invisible.
+
+### 10.3 No edit affordance
+
+**The UI must not permit editing a note.** It will look exactly like a CMS,
+the absence will feel like an oversight, and adding it destroys the
+append-only guarantee that §5 and the entire audit trail rest on. Corrections
+go through `note(supersedes=...)` like everything else. Stated here explicitly
+so it is not added later by someone reasonable.
+
+Snapshot repair is not an exception: a snapshot with no content is being
+filled, not rewritten, and a snapshot that already holds content is immutable
+like the note it witnesses.
+
+### 10.4 Irreducible failure
+
+Some targets cannot be preserved at all: dead before capture, DRM-protected,
+interaction-dependent, or purely audiovisual with no text. The correct
+response is to record the failure durably and **stop retrying**.
+
+Such a note remains valid. It cites a source nobody can check, which is a
+property of the snapshot and weaker evidence — not a defect in the note, and
+never grounds for superseding it.
+
+### 10.5 Concurrency
+
+The MCP server, the async workers, and this interface are separate processes
+against one SQLite file. WAL mode and `busy_timeout` are not optional once the
+UI exists.
+
+---
+
+## 11. Versioning
+
+### 11.1 Three independent versions
+
+| version | what it describes | changes when |
+|---|---|---|
+| `spec_version` | the contract in this document | semantics or surface change |
+| `software_version` | the implementation | any release, ordinary semver |
+| `store_version` | the on-disk schema | a migration is required |
+
+They are deliberately not coupled. Software 0.3.1 may implement spec 1.1
+against a store at schema 2. A spec revision that only adds an optional
+argument needs no migration and leaves `store_version` alone.
+
+### 11.2 Spec version discipline
+
+- **Major** — a change that breaks existing callers or existing stores.
+  Removing an argument, changing a return shape, requiring a migration.
+- **Minor** — additive. A new optional argument, a new return field, a new
+  tool. Old callers keep working.
+- **Patch** — clarification with no behavioural consequence.
+
+**Bump on semantic change, not only on signature change.** This is the rule
+that is easy to get wrong. Switching §5.2's combination rule from maximum to
+minimum, altering θ, or widening §6.1's recovery radius changes nothing about
+any signature and changes everything about what the server returns. Those are
+major revisions. A version that only moves when arguments move will
+misrepresent the server while looking correct.
+
+**Keep the number in one place.** The document header is authoritative; the
+implementation holds a `SPEC_VERSION` constant and a test asserts the two
+match. Without that they drift, usually within one release.
+
+### 11.3 Build order
+
+Not part of the contract, but the versions above only make sense against it.
+
+1. **FTS only.** Notes, assessments, the five data tools, `help`, FTS5. No
+   embedder, no async worker, no Ollama dependency. Complete and usable.
+   Reports `vector: false`.
+2. **Vector.** Embedding worker, `embedding_meta`, hybrid fusion. §6.3's
+   async discipline matters from here on.
+3. **Checker.** §7, as a subcommand sharing the DAG traversal code.
+4. **Review interface.** §10. Snapshots may land here or in increment 2
+   depending on how early link capture matters.
+
+### 11.4 History
+
+- **1.0** — initial handoff to implementation. Core model, five tools,
+  `retained` semantics with maximum combination, storage, consistency
+  checking, identifiers, growth management.
+- **1.1** — versioning discipline (§11), `help` tool (§3.6), `meta` table,
+  capability reporting, markdown convention (§6.4), derived `link` table
+  (§6.5), per-note immutable `snapshot` table capturing link content at write
+  time (§6.6), `with_sources` on `read`, snapshot status histogram in `help`
+  and the corresponding checker rows, local review interface (§10), `links`
+  and `backlinks` on `read`.
+
+---
+
+## 12. Explicitly out of scope
+
+- Document/corpus indexing. Notes reference external artifacts by hash and
+  URL, and §6.5 indexes those references and their liveness — but fetching,
+  storing, or searching the artifacts themselves is a separate system that
+  may never be needed.
+- Multi-user access, auth, remote transport. Local stdio, single user. The
+  review interface (§10) is localhost-only for the same reason.
+- Credential storage of any kind. §10.2 resolves authenticated targets by
+  accepting content, never secrets.
 - Automatic note extraction from conversation. Writes are explicit.
+- Reference management. The resemblance to Zotero is real but the hierarchy is
+  inverted: there, sources are the spine and notes hang off them; here, notes
+  are the spine and snapshots are witnesses to them. Collections, tags,
+  citation styles, BibTeX export, and PDF annotation belong to a tool that
+  already exists and does them better. The belief history in §5 is what this
+  design is for, and it is the thing a reference manager does not have.

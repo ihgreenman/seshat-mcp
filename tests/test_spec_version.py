@@ -23,7 +23,12 @@ def parse(version: str) -> tuple[int, ...]:
 
 @pytest.fixture(scope="module")
 def doc_version() -> str:
-    match = re.search(r"^\*\*Spec version:\*\*\s*([0-9]+(?:\.[0-9]+)*)", SPEC.read_text(), re.M)
+    # Tolerant of where the bold markers fall: 1.0 wrote "**Spec version:** 1.0",
+    # 1.1 writes "**Spec version: 1.1.**". The version is the payload; the
+    # markdown around it is not worth failing a build over.
+    match = re.search(
+        r"^\*\*Spec version:\*{0,2}\s*([0-9]+(?:\.[0-9]+)*)", SPEC.read_text(), re.M
+    )
     assert match, "the spec must declare its version in the header"
     return match.group(1)
 

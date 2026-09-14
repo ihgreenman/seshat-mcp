@@ -8,15 +8,21 @@ the shape RRF will use once the vector side lands (§6, `_rrf`).
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from . import ids
+from . import ids, links
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .snapshots import SnapshotStore
+
+log = logging.getLogger("seshat.store")
 
 DEFAULT_THETA = 0.8
 """Pool-membership threshold (§5.1). Open question §9.2 -- no principled basis."""
@@ -27,7 +33,9 @@ RRF_K = 60
 DEFAULT_LIMIT = 20
 DEFAULT_EDGE_LIMIT = 10
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""On-disk schema version -- `store_version` in §11.1, independent of both the
+spec version and the software version."""
 
 SCHEMA = """
 CREATE TABLE note (
@@ -89,6 +97,30 @@ CREATE TABLE near_miss (
 );
 """
 
+MIGRATION_2 = """
+-- Store identity. Written at creation, bumped only on migration. §11.2
+CREATE TABLE meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+
+-- Derived index over note text. Rebuildable, disposable. §6.5
+-- Shares a key with `snapshot`, which is neither -- see snapshots.py.
+CREATE TABLE link (
+  note_id  TEXT NOT NULL REFERENCES note(id),
+  kind     TEXT NOT NULL,         -- 'url' | 'hash' | 'note'
+  target   TEXT NOT NULL,
+  label    TEXT,                  -- markdown anchor text, if any
+  PRIMARY KEY (note_id, kind, target)
+);
+CREATE INDEX link_target ON link(target);   -- backlinks and DISTINCT target
+"""
+
+MIGRATIONS: dict[int, str] = {2: MIGRATION_2}
+"""Applied in order to reach SCHEMA_VERSION. A fresh store runs SCHEMA and then
+every migration, so a migrated store and a fresh one are byte-identical in
+structure -- which `tests/test_migration.py` checks rather than assumes."""
+
 
 class SeshatError(Exception):
     """Base for errors the tool surface reports back to a caller."""
@@ -138,6 +170,10 @@ class Record:
     superseded_by: list[dict[str, Any]] = field(default_factory=list)
     superseded_by_total: int = 0
     heads: list[str] = field(default_factory=list)
+    links: list[dict[str, Any]] = field(default_factory=list)
+    backlinks: list[dict[str, Any]] = field(default_factory=list)
+    backlinks_total: int = 0
+    sources: list[dict[str, Any]] | None = None
     resolved_by_proximity: dict[str, Any] | None = None
 
 
@@ -187,10 +223,17 @@ def synchronized(method):
 
 
 class Store:
-    def __init__(self, path: str | Path, theta: float = DEFAULT_THETA):
+    def __init__(
+        self,
+        path: str | Path,
+        theta: float = DEFAULT_THETA,
+        snapshots: "SnapshotStore | None" = None,
+    ):
         self.path = str(path)
         self.theta = theta
+        self.snapshots = snapshots
         self._lock = threading.RLock()
+        self._on_captures_queued: Any = None
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
@@ -203,15 +246,49 @@ class Store:
         self.db.close()
 
     def _ensure_schema(self) -> None:
+        """Create or migrate. `PRAGMA user_version` is authoritative; `meta`
+        mirrors it for §3.6's reporting contract."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version == 0:
-            with self.db:
-                self.db.executescript(SCHEMA)
-                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif version != SCHEMA_VERSION:
+        fresh = version == 0
+        if version > SCHEMA_VERSION:
             raise SeshatError(
-                f"store {self.path} is schema version {version}, this build speaks {SCHEMA_VERSION}"
+                f"store {self.path} is schema version {version}, newer than this "
+                f"build's {SCHEMA_VERSION}. Upgrade seshat rather than downgrading the store."
             )
+
+        with self.db:
+            if fresh:
+                self.db.executescript(SCHEMA)
+                version = 1
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                self.db.executescript(MIGRATIONS[target])
+                self._on_migrated(target, fresh)
+            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self._write_meta(fresh)
+
+    def _on_migrated(self, target: int, fresh: bool) -> None:
+        """Data work a migration needs beyond its DDL."""
+        if target == 2 and not fresh:
+            # `link` is derived, so an existing store gets its index built the
+            # same way a rebuild would -- by re-reading note text (§6.5).
+            self._rebuild_links()
+
+    def _write_meta(self, fresh: bool) -> None:
+        from . import SPEC_VERSION
+
+        rows = {"store_version": str(SCHEMA_VERSION)}
+        if fresh:
+            rows["created_under_spec"] = SPEC_VERSION
+            rows["created_at"] = now()
+        for key, value in rows.items():
+            self.db.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def meta(self) -> dict[str, str]:
+        return dict(self.db.execute("SELECT key, value FROM meta"))
 
     # ---------------------------------------------------------------- ids
 
@@ -300,11 +377,13 @@ class Store:
 
         note_id = self.mint_id()
         stamp = now()
+        captured = links.extract(text, exclude=note_id)
         with self.db:
             self.db.execute(
                 "INSERT INTO note(id, desc, text, created_at) VALUES (?, ?, ?, ?)",
                 (note_id, desc, text, stamp),
             )
+            self._index_links(note_id, text)
             for resolution, retained, why in edges:
                 # A brand-new note has no descendants, so creation-time
                 # supersession cannot cycle (§3.4) -- no check needed here.
@@ -313,7 +392,26 @@ class Store:
                        VALUES (?, ?, ?, ?, ?)""",
                     (resolution.id, note_id, retained, why, stamp),
                 )
+        # Committed first, queued after: the note is safe before any capture is
+        # attempted, and a snapshot failure can never fail a write (§6.3).
+        self._queue_captures(note_id, captured)
         return note_id, [r for r, _, _ in edges]
+
+    def _queue_captures(self, note_id: str, found: Iterable[Any]) -> None:
+        """Enqueue URL captures. Swallows everything -- priority 1 (§1).
+
+        Capture-at-creation is the whole preservation model (§6.6), but a
+        stalled or broken snapshot store must degrade to "no witness", never to
+        "the note was not written".
+        """
+        if self.snapshots is None:
+            return
+        try:
+            targets = [link.target for link in found if link.kind == "url"]
+            if targets and self.snapshots.enqueue(note_id, targets) and self._on_captures_queued:
+                self._on_captures_queued()
+        except Exception:
+            log.exception("could not queue snapshot capture for %s", note_id)
 
     @synchronized
     def add_assessment(
@@ -358,6 +456,65 @@ class Store:
             "asserted_at": stamp,
             "resolved_by_proximity": _proximity(old, new),
         }
+
+    # --------------------------------------------------------------- links
+
+    def _index_links(self, note_id: str, text: str) -> None:
+        """Populate the derived `link` index for one note (§6.5).
+
+        Extraction failures are not write failures: a note whose text confuses
+        the extractor is stored with fewer links, never rejected (§6.4).
+        """
+        for link in links.extract(text, exclude=note_id):
+            self.db.execute(
+                "INSERT OR IGNORE INTO link(note_id, kind, target, label) VALUES (?, ?, ?, ?)",
+                (note_id, link.kind, link.target, link.label),
+            )
+
+    def _rebuild_links(self) -> None:
+        """Drop and re-extract the derived link index.
+
+        SAFE BY CONSTRUCTION, AND ONLY BY CONSTRUCTION. `link` is regenerable
+        from note text in seconds. `snapshot` shares its (note_id, target) key
+        and is gone forever if dropped -- it is the only unrecoverable data in
+        the system. The two live in SEPARATE DATABASE FILES (see snapshots.py)
+        precisely so that this method cannot reach the snapshot table even if
+        someone edits the statement below. Do not "simplify" that apart.
+        """
+        self.db.execute("DELETE FROM link")
+        for row in self.db.execute("SELECT id, text FROM note").fetchall():
+            self._index_links(row["id"], row["text"])
+
+    @synchronized
+    def reindex_links(self) -> int:
+        with self.db:
+            self._rebuild_links()
+        return self.db.execute("SELECT COUNT(*) FROM link").fetchone()[0]
+
+    def links_of(self, note_id: str) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT kind, target, label FROM link WHERE note_id = ? ORDER BY kind, target",
+            (note_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def backlinks_of(self, note_id: str, limit: int) -> tuple[list[dict[str, Any]], int]:
+        """Notes whose text references this one (§3.3).
+
+        Not optional, and truncation must carry its count: a hub note is
+        exactly the case that overflows, and a truncated list without the total
+        reports a hub as a leaf.
+        """
+        total = self.db.execute(
+            "SELECT COUNT(*) FROM link WHERE kind = 'note' AND target = ?", (note_id,)
+        ).fetchone()[0]
+        rows = self.db.execute(
+            """SELECT n.id, n.desc FROM link l JOIN note n ON n.id = l.note_id
+               WHERE l.kind = 'note' AND l.target = ?
+               ORDER BY n.created_at DESC, n.id LIMIT ?""",
+            (note_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows], total
 
     # --------------------------------------------------------------- graph
 
@@ -429,7 +586,9 @@ class Store:
     # ---------------------------------------------------------------- read
 
     @synchronized
-    def read(self, raw: str, edge_limit: int = DEFAULT_EDGE_LIMIT) -> Record:
+    def read(
+        self, raw: str, edge_limit: int = DEFAULT_EDGE_LIMIT, with_sources: bool = False
+    ) -> Record:
         resolution = self.resolve(raw)
         row = self.db.execute(
             "SELECT id, desc, text, created_at FROM note WHERE id = ?", (resolution.id,)
@@ -437,6 +596,7 @@ class Store:
 
         out_edges, out_total = self._edges("old_id", resolution.id, "new_id", edge_limit)
         in_edges, in_total = self._edges("new_id", resolution.id, "old_id", edge_limit)
+        back, back_total = self.backlinks_of(resolution.id, edge_limit)
 
         return Record(
             id=row["id"],
@@ -448,8 +608,19 @@ class Store:
             superseded_by=out_edges,
             superseded_by_total=out_total,
             heads=self.heads(resolution.id),
+            links=self.links_of(resolution.id),
+            backlinks=back,
+            backlinks_total=back_total,
+            sources=self._sources(resolution.id) if with_sources else None,
             resolved_by_proximity=_proximity(resolution),
         )
+
+    def _sources(self, note_id: str) -> list[dict[str, Any]]:
+        """Preserved link content, opt-in because it would otherwise wreck every
+        return (§6.6). Verification is adjacency, not a pass."""
+        if self.snapshots is None:
+            return []
+        return self.snapshots.sources_for(note_id)
 
     def _edges(
         self, anchor: str, note_id: str, other: str, limit: int

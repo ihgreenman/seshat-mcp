@@ -7,6 +7,8 @@ name = "seshat-mcp"
 version = "0.1.0"
 description = "A persistent note store an LLM assistant can query and write cheaply"
 requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Ian Greenhoe" }]
 dependencies = ["mcp>=2.0", "pydantic>=2.0"]
 
 [project.scripts]

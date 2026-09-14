@@ -19,6 +19,13 @@ this list rather than the EFF diceware lists.
 - **`mcp`** — the official Model Context Protocol Python SDK, by Anthropic. MIT.
 - **`pydantic`** — Samuel Colvin and contributors. MIT.
 
+## Licensing
+
+seshat-mcp is © 2026 Ian Greenhoe and licensed under the MIT License; see
+`LICENSE`. The design document states the same terms and asks that the
+copyright and permission notice be preserved in any implementation derived
+from it.
+
 ## Design and implementation
 
 The design in `docs/seshat-mcp-spec.md` emerged from a design conversation
