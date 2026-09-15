@@ -5,11 +5,21 @@ Distribution name `seshat-mcp`; CLI and MCP server identifier both `seshat`.
 Note that `seshat` is taken on crates.io (a Matrix event indexer), which
 matters only if the implementation goes to Rust.
 
-**Spec version: 1.2.** See §11 for versioning discipline and history.
+**Spec version: 1.3.** See §11 for versioning discipline and history.
 
 **Status:** implementation at increment 2 (software 0.2.0, store schema 3).
-1.2 revises §6 against measured retrieval results; all changes are additive
-or narrowing-of-claims. No signature removed, no migration required.
+1.3 adds capture-time evidence (§6.9) and the capture/analysis split
+(§6.10). All changes since 1.0 are additive or narrowing-of-claims. No signature
+removed. 1.3 adds two `snapshot` columns and a capability field, so it needs a
+schema bump on a table that is not yet populated — the cheapest migration the
+design will ever get, and a reason to take it now.
+
+**Reading this document:** claims that have been measured cite the
+measurement. Claims that have not are reasoning, and say nothing. §6 is
+largely the former; §5 and §7 are entirely the latter — the `retained`
+semantics are testable only for self-consistency against the rules stated
+here, and the checker's severities are judgement. The §6 numbers lend them no
+credibility.
 
 **Provenance:** this design emerged from a design conversation between Ian Greenhoe
 and Claude (Opus 5), September 2026. Decisions and their rationale are recorded below;
@@ -129,6 +139,29 @@ So `context` returns three things per result, not one:
 handed five results when the store contains nothing relevant has no way to
 say so.
 
+Measured against 20 queries the store cannot answer: `score` is worthless —
+identical values appear in both the answerable and unanswerable sets.
+`vector_similarity` separates them (medians 0.699 against 0.517) but overlaps
+in 0.514–0.612, so it is a signal, not a gate. `matched` is independently
+informative: an unanswerable query's top hit is vector-only 11 times in 20
+against 1 in 20 for answerable ones, because with nothing lexically in common
+the keyword side has nothing to say and its silence is data. Requiring both
+retrievers *and* a cosine floor rejects all 20, at the same overall accuracy
+with errors running in the safer direction.
+
+Two cautions on those numbers. Cosines from `nomic-embed-text` occupy a
+compressed 0.46–0.79 band, so **no absolute threshold transfers across models
+or dimensions** — a persisted threshold is model-keyed state and belongs
+beside `embedding_meta`, invalidated on re-embed. And `matched`'s power is
+inverse to store difficulty: it works because an unanswerable query shares no
+content words with anything, which in the near-duplicate regime (§8) stops
+being true. Do not promote it to a hard rule without re-measuring there.
+
+**On an empty query, all three are null — never zero.** A recency listing
+(§3.2) fuses no rankings and has no query vector, so `score`,
+`vector_similarity`, and `matched` are undefined rather than low. Zero would
+read as "nothing matched" when nothing was asked.
+
 **`context` searches content; it does not resolve identifiers.** Note ids
 appear in neither the FTS columns nor the embedding input, so
 `context("olive-canvas-bright-zebra")` can only return notes whose *text*
@@ -241,7 +274,8 @@ At minimum:
 ```json
 { "vector": false, "checker": false, "snapshots": false,
   "embedding_model": null, "embedding_backlog": 0,
-  "snapshot_status": { "pending": 0, "ok": 0,
+  "extraction": false,
+  "snapshot_status": { "pending": 0, "unextracted": 0, "ok": 0,
                        "unreachable": 0, "gone": 0, "thin": 0 } }
 ```
 
@@ -261,9 +295,23 @@ collapsed:
 - `unreachable` — transient; retryable.
 - `gone` — the target was already dead at capture. Permanent, and itself
   information.
-- `thin` — extraction yielded implausibly little (§6.6). **Needs human
-  attention while manual recovery is still possible**, which is a deadline the
-  other two do not have.
+- `thin` — extraction yielded implausibly little (§6.6), or failed §6.9's
+  expectation check. **Needs human attention while manual recovery is still
+  possible**, which is a deadline the other two do not have.
+
+**`thin: 0` is a false zero until extraction exists.** Nothing can be assessed
+as thin before extraction runs, so the histogram reports a clean zero
+indistinguishable from "no thin captures" — the same silent-success failure
+the histogram was added to prevent. The capability set therefore carries
+`extraction: false` and the histogram an explicit `unextracted` count; they
+answer different questions and both are needed.
+
+The deadline is on **detection, not extraction**. Extraction is re-runnable
+against stored bytes forever, which is the point of capturing raw. But a
+capture that is a paywall interstitial or a JS shell can only be repaired
+while the page is live, and that cannot be known until extraction runs. Every
+day without it, the population of captures with silently expiring recovery
+windows grows.
 
 Embedding gets only a counter because embedding failures are local,
 deterministic, and always recoverable by re-running. Snapshot failures often
@@ -506,7 +554,8 @@ CREATE TABLE snapshot (
   full_hash     TEXT,             -- over the COMPLETE extraction, not `text`
   full_length   INTEGER,
   raw_length    INTEGER,
-  extraction    TEXT,             -- extractor name/version
+  extraction    TEXT,             -- 'fetch' | 'browser' | 'manual' + version
+  expectation   TEXT,             -- what was sought here, copied at capture §6.9
   PRIMARY KEY (note_id, target)
 );
 
@@ -852,7 +901,95 @@ unless the query is nothing else, so "one two three" still finds the note that
 says it. Paired over 42 queries: 3 wins, 0 losses, 39 ties. Strictly dominant,
 which is the standard a change at this sample size has to meet.
 
-### 6.9 Other
+### 6.9 Capture-time expectation
+
+A snapshot records what a target said. It should also record **what was
+expected of it**, because that is what makes the capture assessable.
+
+The expectation is already available and costs no new write-path argument:
+it is the **markdown anchor text** (§6.4, §6.5). `[texas population
+data](https://example.gov/population/tx)` states the expectation in the act of
+citing. Where the label is missing or degenerate ("here", "this article"), fall
+back to the note's `desc` and the surrounding sentence. `note`'s tool
+description should say that a good label now does double duty.
+
+**Copy the expectation into `snapshot`; do not read it from `link`.** `link` is
+derived and re-extractable, so a later revision could change the label and
+leave a 2024 capture being judged against 2026 intent. A witness records what
+was sought as well as what was found.
+
+What this catches that size and status cannot:
+
+- **Wrong page, not thin page.** A 200-status CDN error, a recycled shortener,
+  a "this content has moved" stub — all produce plausible text of reasonable
+  length. Nothing structural flags them.
+- **Paywalls, decisively.** An interstitial contains "subscribe", "sign in",
+  "accept cookies", and none of the expected terms. The main threat, handled
+  lexically, with nothing clever required.
+- **Semantic drift.** A hash change between two snapshots of one URL says
+  *something* moved. Expectation met at the first capture and failed at the
+  second says it moved *away from what mattered*.
+
+**Check lexically first.** Do not embed the whole extraction and compare it to
+the label: a page-length embedding is the mean-pooling blur that made chunking
+necessary for documents, and §6.7 established these cosines need corpus
+calibration anyway. A second tier, if wanted, is max-sim of the label against
+chunks of the extraction.
+
+> **This must never set `status` automatically.** A statistical table may
+> contain none of the expected words in prose while being a perfect capture.
+> Like §7.2's suggested links, it is candidate generation for §10.2's review
+> queue, never a verdict. Automatic marking would produce false `thin` results
+> on exactly the reference pages most worth preserving.
+
+### 6.10 Capture notes and analysis notes
+
+A browser capture (§10.2) writes **a note**, with the page attached as
+evidence. Notes remain primary; there is no unattached-snapshot lifecycle, no
+staging table, and `note_id` stays mandatory on `snapshot`. The extension is a
+second front door to `note()`, not a new model.
+
+The summary typed at capture time *is* the note's `desc` and `text`, written
+with the page in front of the author — the best available condition for §4.
+
+**Capture and analysis are two notes, not one.** The first says what the page
+contains; the second references the first and says what follows from it. The
+separation is between **testimony** and **judgement**: a capture note is
+checkable against the snapshot beside it, an analysis note is checkable only
+against reasoning. Three consequences:
+
+- **Supersession stops being ambiguous.** Superseding a merged note at 0.4
+  leaves it unknowable whether the page was misread or the inference was
+  wrong. Split, the analysis is superseded and the capture is untouched — "my
+  reading changed, the data did not" becomes readable in the graph.
+- **Backlinks become a citation count.** A capture note referenced by four
+  analyses is a source drawn on repeatedly, which is a sharper salience signal
+  (§8) than the generic one, and distinguishable from a conclusion that is
+  merely often revisited.
+- **§6.9's check lands on the right note.** Verifying a snapshot against an
+  *analysis* would be checking an inference against a source, which no
+  available method can do. Against a capture note it is the tractable
+  question: does this page say what this note says it says.
+
+**The reference runs analysis → capture**, which is the only direction
+available: the capture exists first, and note text is immutable, so nothing
+can gain a link to something written later. Reverse traversal is `backlinks`
+(§3.3). There is no bidirectional field.
+
+**The extension writes the capture note and stops.** Bundling an "and what do
+you think" prompt into the capture flow would re-merge what this section
+separates. The analysis is a separate thought, made in conversation with the
+capture's id in hand.
+
+A capture note's natural summary describes a page rather than states a
+finding, which is closer to a bookmark than to what §4 asks for. That is
+acceptable and self-correcting: a capture that turns out to matter is
+superseded by a real finding at `retained = 1.0`, with the witness already
+attached. But it is also §8 arriving faster from an easy-to-use source, so the
+extension should prompt for **what the page told you**, not what it is. Same
+field, different question, and the question is the whole difference.
+
+### 6.11 Other
 
 **License note:** `sqlite-vec` is MIT OR Apache-2.0 and pre-v1 (v0.1.7,
 March 2026; expect breaking changes). At this corpus size, brute-force KNN
@@ -1045,14 +1182,35 @@ config. The user is already authenticated and already looking at the page. A
 paste box clears the whole paywall/SSO/SPA class of failures and seshat never
 handles a secret.
 
-A browser extension is the better long-term shape for this — one click on the
-page already open and already authenticated, capturing the DOM directly. Same
-principle as the paste box with the friction removed, and it handles SPAs and
-paywalls structurally. Well past increment 4.
+**A browser extension is the stronger form of this**, and it does two distinct
+jobs. *Repair*: something failed, go to the page, click. *Capture*: read a
+page and write the note then and there, with the DOM attached — one click on
+the page already open and already authenticated, handling SPAs and paywalls
+structurally rather than by asking for select-all.
 
-Pasted snapshots record `extraction='manual'`. They are witnesses, but
-human-mediated ones, and the distinction must survive in the data rather than
-becoming invisible.
+**Extension captures have no fetch deadline at all.** §6.6's deadline exists
+because of the gap between reading a page and fetching it afterwards, which is
+where rot and drift live. The browser supplies content at write time, so the
+gap is zero: `snapshot_status.pending` never rises on this path, `thin` is
+decidable immediately, and §10.2's recovery window never opens. That is a
+larger benefit than the friction reduction and the main argument for building
+it early.
+
+What it writes is a note with evidence attached, per §6.10 — not an unattached
+capture awaiting a note.
+
+**Provenance is three-way, not two.** `extraction='manual'` for pasted text,
+`'browser'` for extension captures, `'fetch'` for the worker. The DOM after
+script execution is materially different provenance from pasted text: better
+fidelity, but also rendered *for that viewer*, personalisation and A/B
+bucketing included. Worth distinguishing if the store is ever evidence.
+
+**The extension makes localhost a real trust boundary.** It must post to the
+same 127.0.0.1 interface (§12 excludes remote transport), which means that
+interface now accepts writes originating from a browser, and any page visited
+can attempt them. Origin checking and a local token are required — not because
+the threat is severe, but because "localhost is safe" stops being true the
+moment a browser is a client.
 
 ### 10.3 No edit affordance
 
@@ -1127,8 +1285,13 @@ Not part of the contract, but the versions above only make sense against it.
 2. **Vector.** Embedding worker, `embedding_meta`, hybrid fusion. §6.3's
    async discipline matters from here on.
 3. **Checker.** §7, as a subcommand sharing the DAG traversal code.
-4. **Review interface.** §10. Snapshots may land here or in increment 2
-   depending on how early link capture matters.
+4. **Snapshot capture and extraction.** §6.6, §6.9. Ahead of §10: the
+   detection deadline accrues daily, and `thin` reports a false zero until
+   extraction exists. Capture raw first if extraction is not same-day work —
+   raw bytes are re-extractable, an unfetched page is not.
+5. **Review interface.** §10.
+6. **Browser extension.** §10.2. Eliminates the capture deadline entirely for
+   anything captured through it (§6.10).
 
 ### 11.4 History
 
@@ -1150,6 +1313,16 @@ Not part of the contract, but the versions above only make sense against it.
   identifiers, new §6.8 on pre-fusion filtering. Open question on `k` removed;
   §9.2 (θ) and §9.5 (link similarity) remain, both waiting on the
   near-duplicate regime; §9.6 added for the no-answer case.
+- **1.3** — §9.6 resolved: `vector_similarity` and `matched` are two
+  independent triage signals, neither a hard threshold, with cosine bands
+  model-keyed and `matched` weaker in the near-duplicate regime. Null (never
+  zero) for all three on an empty query. New §6.9 (capture-time expectation,
+  carried by markdown anchor text, never auto-setting `status`) and §6.10
+  (capture notes and analysis notes as separate notes, reference running
+  analysis → capture). `extraction` becomes three-valued; `unextracted` added
+  to the snapshot histogram and `extraction` to the capability set, closing
+  the `thin: 0` false zero. §10.2 expanded for the extension; build order
+  reordered to put snapshots ahead of the review interface.
 
 ---
 
