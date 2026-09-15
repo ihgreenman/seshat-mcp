@@ -144,6 +144,72 @@ store explicitly holds notes referencing artifacts by content hash (§12), and
 that retracting the wrong artifact is exactly the kind of error the design exists
 to prevent, it is a good argument — but it should be stated for what it is.
 
+### 3.1 Note ids specifically (follow-up suggested by Chat)
+
+§6.1 chose BIP-39 words over random base32 precisely because words are *native
+tokens*. That predicts note ids should behave unlike hex digests under
+embedding. Three notes were given ids one word-edit apart and queried for:
+
+```
+olive-canvas-bright-zebra     olive-canvas-bright-yellow     olive-canvas-brisk-zebra
+```
+
+**(b) Querying an id, looking for the note that cites it** — the direct analogue
+of the hash test:
+
+| query | FTS | Vector | Hybrid | vector's top hit |
+|---|---|---|---|---|
+| `olive-canvas-bright-zebra` | 1 | 2 | 1 | cites **-bright-yellow** (wrong) |
+| `olive-canvas-bright-yellow` | 1 | 1 | 1 | correct |
+| `olive-canvas-brisk-zebra` | 1 | 1 | 1 | correct |
+| **MRR** | **1.000** | **0.833** | **1.000** | |
+
+Word ids do measurably better than hex — 2 of 3 correct against 1 of 3 for the
+hash and version sets — which is evidence *for* §6.1's choice of wordlist over
+base32. But they still fail, and they fail the same way: asked for
+`…-bright-zebra`, the vector side returns the note citing `…-bright-yellow`.
+Native tokens make the collapse partial rather than total; they do not prevent
+it. **The hybrid justification in §3 covers note ids too.**
+
+**(a) Querying an id, looking for the note that *has* that id** — and this is the
+unexpected one:
+
+| query | FTS | Vector | Hybrid |
+|---|---|---|---|
+| all three ids | — | — | — |
+
+**No retriever finds a note by its own identifier. None. Ever.** `note_fts`
+indexes `desc` and `text`; the embedding is `desc + text`. A note's id appears in
+neither, so `context("olive-canvas-bright-zebra")` cannot return that note — it
+can only return notes whose *text mentions* the id.
+
+This is consistent with the spec rather than contrary to it: §3.2 never promises
+id lookup, `read(id)` is the symbol-addressing path with its own lenient
+resolution, and §6.1 explicitly routes a badly mangled id to `context` on the
+reasoning that the caller "almost certainly still knows what the note was
+*about*" — i.e. to content-addressing, deliberately.
+
+It is still worth stating outright, because the behaviour is surprising and the
+failure is silent. An assistant holding a two-error id — past the recovery radius,
+so `read` has refused it — may well try `context("olive-canvas-brisk-zebr")` next.
+That returns nothing relevant, with no indication that id lookup is simply not a
+thing `context` does.
+
+**Recommendation, for the spec rather than for me to decide:** either
+
+1. say so explicitly in §3.2 ("`context` searches content; it does not resolve
+   identifiers"), and have the `NoteNotFound` message steer toward topic search —
+   the current message already says "find it by what it was about", which is
+   most of the way there; or
+2. add `id` to the FTS columns, making exact id lookup work through `context` as
+   a side effect. Three lines plus a migration, and ids are rare tokens so the
+   noise cost is near zero.
+
+These pull in opposite directions — (1) keeps symbol- and content-addressing
+cleanly separated as §6.1 intends, (2) is more forgiving of the failure mode
+§6.1 anticipates. Not implemented either way, because it changes what `context`
+means and that is a spec decision.
+
 ---
 
 ## 4. A defect found by running it, and a lesson about aggregate metrics
@@ -271,6 +337,7 @@ be rediscovered a third time.
 
 ---
 
-*Evaluation harness: `scratchpad/corpus.py`, `evaluate.py`, `identifiers.py`.
+*Evaluation harness: `eval/corpus.py`, `evaluate.py`, `identifiers.py`,
+`note_ids.py`.
 Embeddings cached, so re-running is cheap and does not re-hit Ollama.
 Model: `nomic-embed-text` (768-dim, L2-normalised by Ollama) via local Ollama.*

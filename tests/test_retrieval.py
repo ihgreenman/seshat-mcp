@@ -156,3 +156,25 @@ def test_a_query_of_only_function_words_still_searches(store):
 def test_content_words_are_kept_verbatim():
     assert fts_query("the bilinear transform") == '"bilinear" OR "transform"'
     assert fts_query("nomic-embed-text") == '"nomic" OR "embed" OR "text"'
+
+
+def test_context_cannot_find_a_note_by_its_own_id(store, mk):
+    """Documents a surprising, silent behaviour rather than endorsing it.
+
+    `note_fts` indexes desc and text, and the embedding is desc + text, so a
+    note's id appears in neither index. `context(<id>)` therefore cannot return
+    the note with that id -- only notes whose text mentions it.
+
+    Consistent with the spec: read() is the symbol-addressing path, and §6.1
+    deliberately routes a badly mangled id to content search. But an assistant
+    whose id is past the recovery radius may well try context() next and get
+    nothing, with no hint that id lookup is not something context does.
+
+    Open question in docs/retrieval-findings.md §3.1 -- if the spec decides
+    context should resolve identifiers, this test changes with it.
+    """
+    note_id = mk("Resampler drops a sample at block boundaries")
+    assert [h.id for h in store.context(note_id)] == []
+
+    citing = store.create_note("confirmed on hardware", f"reproduced what {note_id} describes")[0]
+    assert [h.id for h in store.context(note_id)] == [citing], "citations are findable"
