@@ -295,9 +295,10 @@ def test_vector_search_respects_the_pool(vstore):
 
     import seshat.vectors as module
 
-    found = module.search(vstore.db, embed_query(vstore.embedder, "claim"), vstore.theta, 10)
+    found = dict(module.search(vstore.db, embed_query(vstore.embedder, "claim"), vstore.theta, 10))
     assert old not in found
     assert new in found
+    assert all(-1.0 <= v <= 1.0 for v in found.values()), "similarity, not distance"
 
 
 def test_vector_search_respects_since(vstore):
@@ -308,7 +309,8 @@ def test_vector_search_respects_since(vstore):
 
     import seshat.vectors as module
 
-    found = module.search(vstore.db, embed_query(vstore.embedder, "note"), vstore.theta, 10, later)
+    found = [i for i, _ in module.search(
+        vstore.db, embed_query(vstore.embedder, "note"), vstore.theta, 10, later)]
     assert found == [second]
 
 
@@ -352,3 +354,75 @@ def test_vectors_are_unit_length_as_stored(vstore):
 
     values = struct.unpack(f"<{DIM}f", row[0])
     assert math.isclose(l2_norm(values), 1.0, rel_tol=1e-5)
+
+
+# ----------------------------------------------- §3.2: what a result carries
+
+
+def test_score_is_a_sort_key_not_a_confidence(vstore, embedder):
+    """The demotion in spec 1.2. A perfect match and a worthless one score
+    identically at rank 1, which is why `score` must not be read as relevance."""
+    vstore.create_note("exactly what was asked for", "alpha beta gamma")
+    EmbeddingWorker(vstore).drain()
+    good = vstore.context("alpha beta gamma")[0].score
+
+    other = Store(vstore.path.replace("v.db", "other.db"), embedder=embedder)
+    other.create_note("something else entirely", "zeta eta theta")
+    EmbeddingWorker(other).drain()
+    weak = other.context("zeta")[0].score
+    other.close()
+
+    assert good == weak, "rank 1 is rank 1; the score cannot tell them apart"
+
+
+def test_results_carry_vector_similarity(vstore):
+    """The field that can actually be low (§3.2)."""
+    vstore.create_note("Nyquist precision loss", "prewarping fixes it")
+    EmbeddingWorker(vstore).drain()
+
+    hit = vstore.context("nyquist")[0]
+    assert hit.vector_similarity is not None
+    assert -1.0 <= hit.vector_similarity <= 1.0
+
+
+def test_similarity_is_reported_for_keyword_only_hits_too(vstore, embedder):
+    """A keyword coincidence with a low cosine is exactly what a caller needs
+    to see, so similarity is computed for every returned note -- not only the
+    ones the vector side ranked highly."""
+    vstore.create_note("alpha", "alpha content")
+    vstore.create_note("beta", "beta content")
+    vstore.create_note("gamma", "gamma content")
+    EmbeddingWorker(vstore).drain()
+
+    for hit in vstore.context("alpha"):
+        assert hit.vector_similarity is not None, hit
+
+
+def test_similarity_is_null_when_the_vector_side_cannot_answer(vstore, embedder):
+    """Null means 'unknown', not 'zero' -- a caller must not read an absent
+    measurement as a low one."""
+    note_id, _ = vstore.create_note("Nyquist precision loss", "prewarping")
+    assert vstore.embedding_backlog() == 1
+    hit = vstore.context("nyquist")[0]
+    assert hit.vector_similarity is None
+    assert hit.matched == ("fts",)
+
+
+def test_matched_reports_which_retrievers_contributed(vstore, embedder):
+    vstore.create_note("alpha beta", "alpha beta")
+    EmbeddingWorker(vstore).drain()
+    embedder.table[QUERY_PREFIX + "alpha beta"] = embedder._vector(
+        DOCUMENT_PREFIX + document_text("alpha beta", "alpha beta")
+    )
+
+    hit = vstore.context("alpha beta")[0]
+    assert set(hit.matched) == {"fts", "vector"}
+
+    embedder.fail = True
+    assert vstore.context("alpha beta")[0].matched == ("fts",)
+
+
+def test_recency_listing_is_labelled_as_such(vstore):
+    vstore.create_note("a note", "body")
+    hit = vstore.context("")[0]
+    assert hit.matched == ("recency",), "no retriever ran; say so rather than implying one did"

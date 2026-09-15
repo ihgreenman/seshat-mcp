@@ -7,9 +7,11 @@ structural: an Embedder implements only `embed(texts)`, and the two module-level
 functions below are the sole path that adds a prefix. There is no parameter to
 get wrong and no second implementation to keep in step.
 
-(A probe of that claim against nomic on a 15-note corpus could not detect a
-difference between the four prefix schemes. That is a null result on too small
-a sample, not a refutation, so the prefixes are applied as specified.)
+Spec 1.2 WITHDREW the claim that omitting them degrades retrieval "measurably":
+two attempts failed to measure it, and the second -- 42 queries -- came out 3
+wins to 2 losses paired, which is a coin flip. The prefixes are still applied,
+because they are the documented usage and cost nothing, but no one should
+expect a measurable difference on a corpus of this size.
 """
 
 from __future__ import annotations

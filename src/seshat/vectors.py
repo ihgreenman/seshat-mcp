@@ -86,8 +86,12 @@ def search(
     theta: float,
     limit: int,
     since: str | None = None,
-) -> list[str]:
-    """Pooled note ids by ascending cosine distance.
+) -> list[tuple[str, float]]:
+    """Pooled (note_id, cosine similarity) by descending similarity.
+
+    Similarity rather than distance because that is what `context` reports
+    (§3.2): `vec_distance_cosine` returns 1 - cos, and the value a caller can
+    actually judge is the cosine itself.
 
     The pool filter is applied inside the query rather than afterwards, so a
     retracted note cannot consume one of the `limit` slots (§5.1).
@@ -108,4 +112,22 @@ def search(
             LIMIT ?""",
         params,
     ).fetchall()
-    return [row["id"] for row in rows]
+    return [(row["id"], 1.0 - row["d"]) for row in rows]
+
+
+def similarity_for(db: sqlite3.Connection, vector, note_ids: list[str]) -> dict[str, float]:
+    """Cosine of specific notes against a query vector.
+
+    `search` only reports its own top slice, but `context` fuses two rankings
+    and must report a similarity for every note it returns -- including ones
+    the keyword side found and the vector side ranked below its cut.
+    """
+    if not note_ids:
+        return {}
+    placeholders = ",".join("?" * len(note_ids))
+    rows = db.execute(
+        f"""SELECT note_id, vec_distance_cosine(embedding, ?) AS d
+            FROM note_vec WHERE note_id IN ({placeholders})""",
+        [pack(vector), *note_ids],
+    ).fetchall()
+    return {row["note_id"]: 1.0 - row["d"] for row in rows}

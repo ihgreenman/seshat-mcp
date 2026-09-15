@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .checker import DEFAULT_SIMILARITY, SEVERITIES, Checker, format_report
 from .embeddings import DEFAULT_MODEL, EmbedderUnavailable, OllamaEmbedder
+from .ids import looks_like_id
 from .server import default_db_path, help_payload, serve
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .store import DEFAULT_THETA, SeshatError, Store
@@ -111,9 +112,13 @@ def main(argv: list[str] | None = None) -> int:
             })
             print(json.dumps(report, indent=2))
         elif args.command == "context":
+            if looks_like_id(args.query):
+                print(f"note: {args.query!r} looks like an id; context searches content, "
+                      f"not identifiers -- try `seshat read`", file=sys.stderr)
             hits = store.context(args.query, args.since, args.limit)
             for h in hits:
-                print(f"{h.score:.5f}  {h.id}  {h.desc}")
+                sim = f"{h.vector_similarity:+.3f}" if h.vector_similarity is not None else "  --  "
+                print(f"{h.score:.5f}  cos {sim}  {','.join(h.matched):<11}  {h.id}  {h.desc}")
         elif args.command == "read":
             from dataclasses import asdict
             print(json.dumps(asdict(store.read(args.id)), indent=2))

@@ -70,6 +70,20 @@ def split(raw: str) -> list[str]:
     return [t for t in _SEPARATORS.split(raw.strip().lower()) if t]
 
 
+def looks_like_id(text: str) -> bool:
+    """Is this query shaped like an id -- four hyphenated words (§3.2)?
+
+    Shape only, deliberately: an id that no longer exists, or was mistyped into
+    non-words, is exactly the case where the caller most needs telling that
+    `context` does not resolve identifiers. Requiring the words to be real
+    BIP-39 would stay silent precisely when the hint is most useful.
+
+    Detection is free and requires no index change.
+    """
+    tokens = split(text)
+    return len(tokens) == WORD_COUNT and all(t.isalpha() for t in tokens)
+
+
 def canonical_word(token: str) -> str | None:
     """Expand one token to a BIP-39 word, accepting four-character prefixes."""
     if token in _WORD_SET:

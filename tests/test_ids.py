@@ -184,3 +184,46 @@ def test_exact_hits_never_write_a_near_miss(store, mk):
 def test_minted_ids_do_not_collide(store):
     made = {store.create_note(f"n{i}", "body")[0] for i in range(200)}
     assert len(made) == 200
+
+
+def test_id_resolution_never_consults_vector_similarity(store, mk, monkeypatch):
+    """§6.1, spec 1.2: id resolution is lexical only.
+
+    Word ids embed as roughly the average of four concepts, so two ids
+    differing in one word land almost on top of each other. If near-miss
+    recovery consulted embedding similarity it would confidently return *a
+    different real note* in place of the clean not-found that §6.1's sparsity
+    argument exists to guarantee.
+
+    "Ids are words, and words embed fine" is a plausible and wrong inference,
+    so this asserts the vector path is not reachable from resolution at all.
+    """
+    import seshat.vectors as module
+
+    mk("a real note")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("id resolution must not consult vector similarity")
+
+    monkeypatch.setattr(module, "search", forbidden)
+    monkeypatch.setattr(module, "similarity_for", forbidden)
+
+    with pytest.raises(NoteNotFound):
+        store.resolve("zoo-zoo-zoo-zoo")
+    assert store.resolve(mk("another note")) is not None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("olive-canvas-bright-zebra", True),
+    ("OLIVE CANVAS BRIGHT ZEBRA", True),
+    ("zoo-zoo-zoo-zoo", True),
+    ("notaword-notaword-notaword-notaword", True),
+    ("why does my filter cutoff move", False),
+    ("olive-canvas-bright", False),
+    ("olive-canvas-bright-zebra-extra", False),
+    ("sha256:abc123", False),
+])
+def test_id_shaped_queries_are_detected_by_shape_alone(text, expected):
+    """§3.2's hint fires on shape, not validity -- a mistyped id is exactly when
+    the caller most needs telling that context does not resolve identifiers."""
+    assert ids.looks_like_id(text) is expected

@@ -5,11 +5,11 @@ Distribution name `seshat-mcp`; CLI and MCP server identifier both `seshat`.
 Note that `seshat` is taken on crates.io (a Matrix event indexer), which
 matters only if the implementation goes to Rust.
 
-**Spec version: 1.1.** See §11 for versioning discipline and history.
+**Spec version: 1.2.** See §11 for versioning discipline and history.
 
-**Status:** 1.1 handed off to implementation. All changes from 1.0 are
-additive — no signature removed, no return shape narrowed, no migration
-required. Work completed against 1.0 remains correct.
+**Status:** implementation at increment 2 (software 0.2.0, store schema 3).
+1.2 revises §6 against measured retrieval results; all changes are additive
+or narrowing-of-claims. No signature removed, no migration required.
 
 **Provenance:** this design emerged from a design conversation between Ian Greenhoe
 and Claude (Opus 5), September 2026. Decisions and their rationale are recorded below;
@@ -108,8 +108,34 @@ Primary retrieval. Hybrid search (§6) over the note pool.
 - `limit` — result cap.
 
 **Returns the fused score with each result.** A bare list implies that
-everything in it is relevant, and a reader will act accordingly. The score
-is what makes honest triage possible.
+everything in it is relevant, and a reader will act accordingly.
+
+**But the RRF score cannot carry confidence, and must not be presented as
+if it does.** `Σ 1/(k + rank)` is derived from position alone: a perfect match
+at rank 1 and a worthless single-token match at rank 1 receive *identical*
+scores. Measurement confirms it — the fused score is invariant across a 60×
+range of `k` (§6.8), which is what a number encoding almost nothing looks
+like. Rank-blindness in fusion (§6.7) propagates straight to the output.
+
+So `context` returns three things per result, not one:
+
+| field | meaning |
+|---|---|
+| `score` | fused RRF value. **Sort key only.** Comparable within a result set, meaningless across them. |
+| `vector_similarity` | raw cosine of the best-matching embedding, or null if unembedded. This is the value that can actually be *low*. |
+| `matched` | which retrievers contributed — `["fts", "vector"]`, `["vector"]`, etc. |
+
+`vector_similarity` is what makes honest triage possible. Without it, a caller
+handed five results when the store contains nothing relevant has no way to
+say so.
+
+**`context` searches content; it does not resolve identifiers.** Note ids
+appear in neither the FTS columns nor the embedding input, so
+`context("olive-canvas-bright-zebra")` can only return notes whose *text*
+mentions that id — never the note that has it. This is deliberate (§6.1) and
+it is the correct division, but it is silent, so: when a query is shaped like
+an id — four hyphenated lowercase words — the response carries a note saying
+so and pointing at `read`. Detection is free and requires no index change.
 
 Returns `desc`, never bodies. Bodies are paid for individually via `read`.
 
@@ -512,11 +538,17 @@ token frequency, so semantic similarity degrades toward lexical overlap —
 which FTS5 already does better. Only pull from Ollama's embedding library.
 
 **nomic requires asymmetric task prefixes.** `search_document:` when storing,
-`search_query:` when querying. Ollama does not add them. Omitting them, or
-using the same prefix on both sides, degrades retrieval measurably and
-silently — nothing errors. Qwen3 is likewise instruction-aware on the query
-side only. Keep the prefixes in one place; they are easy to get wrong in
-exactly one code path.
+`search_query:` when querying. Ollama does not add them. Qwen3 is likewise
+instruction-aware on the query side only. Keep the prefixes in one place; they
+are easy to get wrong in exactly one code path.
+
+This is the documented usage and costs nothing, which is why it is specified.
+**The size of the effect is unmeasured.** Two attempts to detect it found
+nothing defensible: at 40 notes and 42 queries, correct-versus-both-document
+shows +0.043 MRR but 3 wins against 2 losses paired, which is a coin flip.
+Earlier revisions of this document claimed the difference was "measurable";
+that claim is withdrawn. If it matters it will show at larger scale or in the
+near-duplicate regime (§8), neither of which has been tested.
 
 (nomic's Ollama card lists 2,048 context against a native 8,192; set
 `num_ctx` if that ever matters. It does not, for notes.)
@@ -528,10 +560,14 @@ reciprocal rank fusion:
 score = Σᵢ 1 / (k + rankᵢ),  k ≈ 60
 ```
 
+`k = 60` is **not a tuning parameter.** Measured, MRR is identical across
+k ∈ [5, 300] — a 60× range. With two rankings over a store of this size, `k`
+only reweights deep ranks against shallow ones, and nearly every answer sits
+in the top three of at least one ranking. Leave it alone; retrieval quality
+does not live there. Revisit only if answers routinely appear at rank 10+.
+
 RRF is rank-based, so incommensurable score scales never have to be
-reconciled. Pure vector search is poor at exact identifiers — function
-names, paper titles, hash prefixes — which is a large share of real queries
-against a store like this.
+reconciled. That freedom has a price, paid in §6.7.
 
 ### 6.1 Identifiers
 
@@ -581,6 +617,20 @@ surviving words carry ~22 bits, but a caller who mangled an id almost
 certainly still knows what the note was *about* — far more information. Switch
 from symbol-addressing to content-addressing rather than pushing a channel
 that has already failed.
+
+**Id resolution is lexical only. Never consult vector similarity.** Word ids
+are opaque identifiers in the sense of §6.7: each BIP-39 word is a real token
+carrying real meaning, so an id embeds as roughly the average of four
+concepts, and two ids differing in one word land almost on top of each other.
+Measured, vector-only retrieval asked for one id returns the note holding a
+one-word-different id — the same collapse hex digests show, partial rather
+than total. Native tokens help; they do not rescue it.
+
+The consequence is specific: if near-miss recovery ever consulted embedding
+similarity, it would confidently return **a different real note** in place of
+the clean not-found that this section's sparsity argument was built to
+guarantee. "Ids are words, and words embed fine" is a plausible and wrong
+inference for an implementer to make, which is why it is written down here.
 
 **The `near_miss` table** records every miss. Its value is that it separates
 two failure modes that otherwise look identical:
@@ -750,7 +800,59 @@ and belongs nowhere in §7. Make it answerable on demand instead:
 `read(id, with_sources=False)`, opt-in because preserved text would otherwise
 wreck every return.
 
-### 6.7 Other
+### 6.7 Why hybrid, precisely
+
+The general case does not justify it. On a topically spread corpus, hybrid
+beats vector-only by 0.967 against 0.963 MRR — paired, 1 win against 2 losses
+over 42 queries. On ordinary conceptual retrieval the vector side does nearly
+all the work and the second retriever is a wash.
+
+**The justification is opaque identifiers, and there it is decisive.** Given
+notes whose identifiers differ by one character, vector-only scores 8/12 exact
+top-1; hybrid scores 12/12, because FTS supplies the exact match at rank 1 and
+RRF cannot lose a rank-1-in-one-ranking result.
+
+The failure mode is what matters, not the score. Asked about three different
+hex digests, the vector side returns **the same wrong note** for all three. It
+has collapsed them to a single point and picks whichever note's surrounding
+prose it prefers. A caller asking about one artifact is confidently handed the
+note about another — silently, repeatably, with no signal that anything went
+wrong. Given §12 has notes referencing artifacts by content hash, and given
+that acting on the wrong artifact is exactly the class of error this design
+exists to prevent, that is a sufficient argument on its own.
+
+**The category is narrower than "exact identifiers."** Word-like identifiers
+embed fine — `SQLITE_LOCKED`, `vec_distance_l2`, `check_same_thread` all
+resolve correctly, because subword tokens carry real signal. The failing
+category is *identifiers whose distinguishing part is not lexical*: hex
+digests, version numbers, UUIDs, line numbers. Note ids are a partial case
+(§6.1): native tokens make the collapse incomplete rather than absent.
+
+### 6.8 Fusion cannot filter; the retrievers must
+
+RRF is **rank-blind by design.** It sees that a note is rank 1 in the keyword
+ranking and cannot see that the match was worthless. A junk rank-1 hit
+contributes exactly what a perfect one does.
+
+This is not hypothetical. Expanding free text to `"combining" OR "two" OR
+"rankings"` lets any single token retrieve a document alone; the query
+*combining two rankings* matched a note on catastrophic cancellation via the
+word "two", entered the keyword ranking at rank 1, and was promoted **above**
+the note the vector side had correctly ranked first. Three individually
+reasonable decisions — OR expansion, rank-blind fusion, no minimum evidence —
+composing into a wrong answer.
+
+**Any precision control must live inside a retriever, before fusion.** RRF's
+benefit is freedom from *cross-retriever* score calibration; a within-retriever
+evidence gate does not touch that, because a BM25 score is never compared to a
+cosine. The two are fully compatible.
+
+The concrete measure taken: function words are dropped from FTS expansion
+unless the query is nothing else, so "one two three" still finds the note that
+says it. Paired over 42 queries: 3 wins, 0 losses, 39 ties. Strictly dominant,
+which is the standard a change at this sample size has to meet.
+
+### 6.9 Other
 
 **License note:** `sqlite-vec` is MIT OR Apache-2.0 and pre-v1 (v0.1.7,
 March 2026; expect breaking changes). At this corpus size, brute-force KNN
@@ -852,6 +954,12 @@ this document. Observations that seem robust:
 
 Recommend deferring any automated pruning until real usage data exists.
 
+**This is also the unmeasured regime for retrieval.** Every retrieval number
+in §6 comes from a topically spread corpus, where almost any retriever
+succeeds. A store full of true-but-useless near-duplicate notes is where
+retrieval actually gets hard, and where §9.2 and §9.5 would become answerable.
+Both problems wait on the same accumulated data.
+
 ---
 
 ## 9. Open questions
@@ -881,11 +989,20 @@ Recommend deferring any automated pruning until real usage data exists.
    plausibly the highest-value query in the system. It can be approximated by
    convention in `desc` first.
 
-5. **Similarity threshold for suggested links.** Unknown. Depends on the
-   embedding model and on how much false-positive tolerance the review
-   workflow has.
+5. **Similarity threshold for suggested links.** Unknown, and unanswerable
+   from current data — it needs the near-duplicate regime (§8), which no
+   corpus measured so far has. Do not synthesise that corpus: notes written to
+   order measure the author's idea of accumulation rather than accumulation.
+   The store is running; the real thing arrives on its own, and the harness
+   caches embeddings so re-running it later is nearly free.
 
-6. **Near-duplicate bodies.** A description-fix supersession duplicates the
+6. **Behaviour when nothing relevant exists.** Every query measured so far has
+   an answer in the corpus, so nothing tests the response to a query the store
+   cannot serve. That is where an over-eager keyword side does the most damage,
+   and where `vector_similarity` (§3.2) has to earn its place. Cheap to add to
+   the existing harness.
+
+7. **Near-duplicate bodies.** A description-fix supersession duplicates the
    body verbatim, costing a re-embed and storing the text twice. Negligible
    at note size; worth revisiting only if chains of near-duplicates
    accumulate.
@@ -1024,6 +1141,15 @@ Not part of the contract, but the versions above only make sense against it.
   time (§6.6), `with_sources` on `read`, snapshot status histogram in `help`
   and the corresponding checker rows, local review interface (§10), `links`
   and `backlinks` on `read`.
+- **1.2** — first revision informed by measurement, against increment 2.
+  `context` returns `vector_similarity` and `matched` alongside `score`, which
+  is demoted to a sort key (§3.2); identifier-shaped queries get a pointer to
+  `read`. Id resolution is stated lexical-only (§6.1). `k` fixed at 60 and
+  declared not a tuning parameter. The prefix "measurable" claim withdrawn as
+  unsupported. New §6.7 narrowing the hybrid justification to non-lexical
+  identifiers, new §6.8 on pre-fusion filtering. Open question on `k` removed;
+  §9.2 (θ) and §9.5 (link similarity) remain, both waiting on the
+  near-duplicate regime; §9.6 added for the no-answer case.
 
 ---
 

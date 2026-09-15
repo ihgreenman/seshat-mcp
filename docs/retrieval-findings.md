@@ -1,7 +1,7 @@
 # Retrieval findings — seshat implementation, spec 1.1
 
 Measured against the increment-2 implementation (software 0.2.0, store schema 3)
-on 2026-09-14. Everything below is empirical unless flagged otherwise.
+on 2026-09-14; §3.1, §6b and §7 added afterwards against spec 1.2. Everything below is empirical unless flagged otherwise.
 
 **Summary for the impatient.** Hybrid retrieval earns its place, but not for the
 reason the aggregate numbers first suggested — on ordinary conceptual queries it
@@ -321,6 +321,58 @@ size is not evidence.** Report paired outcomes.
    policy is going to be set on evidence, that is the experiment worth building
    next, and it needs real accumulated notes rather than written-to-order ones.
 
+## 6b. The no-answer case (spec 1.2 §9.6)
+
+Added after 1.2, using the field 1.2 introduced. 20 answerable queries against
+the 40-note corpus, and 20 plausible technical questions on subjects the corpus
+contains nothing about (kubernetes ingress, sourdough, trademark registration,
+espresso channelling).
+
+**The store returns results for all 20 unanswerable queries. It never says
+"nothing".** That is the damage §9.6 anticipated, confirmed.
+
+**`score` cannot detect it, exactly as §3.2 says.** The same values appear in
+both sets — 0.01639, 0.03252, 0.03279 show up in answerable and absent alike.
+A caller triaging on `score` has no signal at all. This is direct confirmation
+of the demotion rather than an argument for it.
+
+**`vector_similarity` carries real signal, but is not a clean gate:**
+
+| set | min | median | max |
+|---|---|---|---|
+| answerable | 0.514 | **0.699** | 0.790 |
+| absent | 0.459 | **0.517** | 0.612 |
+
+The medians are far apart; the ranges overlap between 0.514 and 0.612. The best
+single threshold is ≈0.59, at 92% (18/20 answerable kept, 19/20 absent
+rejected).
+
+So the field earns its place for its stated purpose — a caller *can* now say
+"everything here is weakly matched, the store probably has nothing on this" —
+but it does not support an automatic cutoff that returns empty. Triage signal,
+not a gate. Worth noting too that nomic's cosines live in a compressed band
+(0.46–0.79 across both sets), so no absolute number like "0.7 means good"
+transfers without calibration against the corpus.
+
+**`matched` is not redundant with it.** Composition of the top hit:
+
+| set | both retrievers | vector-only | fts-only |
+|---|---|---|---|
+| answerable | 18 | 1 | 1 |
+| absent | 8 | **11** | 1 |
+
+An unanswerable query's best hit is usually something only the vector side
+liked — which makes sense: with nothing lexically in common, the keyword side
+has nothing to contribute, and its silence is informative. Combining the two
+signals ("corroborated by both **and** cosine ≥ 0.59") also scores 92%, but
+with a different error profile: **0 of 20 absent queries accepted**, against 1
+for similarity alone, at the cost of one more answerable query rejected. For
+"do not fabricate an answer", that is the better direction for the error to run.
+
+Two independent signals, then, and the spec is right that this is where they
+have to earn their keep. Neither is a threshold to hard-code — both are inputs
+to a judgement, which is what §3.2 asks of them.
+
 ## 7. Unrelated, but found in the same pass
 
 **The spec's own example identifier is not a valid BIP-39 id.** §6.1 illustrates
@@ -338,6 +390,6 @@ be rediscovered a third time.
 ---
 
 *Evaluation harness: `eval/corpus.py`, `evaluate.py`, `identifiers.py`,
-`note_ids.py`.
+`note_ids.py`, `no_answer.py`.
 Embeddings cached, so re-running is cheap and does not re-hit Ollama.
 Model: `nomic-embed-text` (768-dim, L2-normalised by Ollama) via local Ollama.*

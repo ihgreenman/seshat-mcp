@@ -32,7 +32,11 @@ DEFAULT_THETA = 0.8
 """Pool-membership threshold (§5.1). Open question §9.2 -- no principled basis."""
 
 RRF_K = 60
-"""Reciprocal rank fusion constant (§6)."""
+"""Reciprocal rank fusion constant (§6).
+
+**Fixed, not a tuning parameter.** Measured invariant from k=5 to k=300 --
+identical MRR across a 60x range -- so there is nothing here to tune. Spec 1.2
+removed the corresponding open question."""
 
 VECTOR_COOLDOWN = 30.0
 """Seconds to skip the vector side after it fails. Without this, every
@@ -178,9 +182,20 @@ def now() -> str:
 
 @dataclass(frozen=True)
 class Hit:
+    """One retrieval result (§3.2).
+
+    `score` is a SORT KEY, not a confidence. RRF is derived from position
+    alone, so a perfect match at rank 1 and a worthless single-token match at
+    rank 1 score identically -- and the value is invariant across a 60x range
+    of k (§6.8), which is what a number encoding almost nothing looks like.
+    `vector_similarity` is the field that can actually be low.
+    """
+
     id: str
     desc: str
     score: float
+    vector_similarity: float | None = None
+    matched: tuple[str, ...] = ()
 
 
 @dataclass
@@ -767,7 +782,9 @@ class Store:
         ).fetchall()
         return [r["id"] for r in rows]
 
-    def _vector_ranking(self, text: str, since: str | None, limit: int) -> list[str] | None:
+    def _vector_ranking(
+        self, text: str, since: str | None, limit: int
+    ) -> tuple[list[str], dict[str, float], list[float]] | None:
         """Semantic ranking, or None if the vector side cannot answer right now.
 
         None is a legitimate, expected outcome (§6.3): no extension, no
@@ -782,7 +799,8 @@ class Store:
             log.info("vector side unavailable for this query (%s); using FTS only", exc)
             self._vector_cooldown_until = time.monotonic() + VECTOR_COOLDOWN
             return None
-        return vectors.search(self.db, vector, self.theta, limit, since)
+        scored = vectors.search(self.db, vector, self.theta, limit, since)
+        return [i for i, _ in scored], dict(scored), vector
 
     @synchronized
     def context(
@@ -805,26 +823,57 @@ class Store:
             # Empty or unusable query: recency listing. There is nothing for
             # either retriever to match on, so no fusion happens.
             ordered = self._recent(since, limit)
-            return self._hydrate({note_id: _rrf(i) for i, note_id in enumerate(ordered, 1)}, limit)
+            scores = {note_id: _rrf(i) for i, note_id in enumerate(ordered, 1)}
+            return self._hydrate(scores, limit, {"recency": ordered}, None)
 
-        rankings = [self._fts_ranking(query, since, limit)]
+        keyword = self._fts_ranking(query, since, limit)
+        contributors: dict[str, list[str]] = {"fts": keyword}
+        rankings = [keyword]
+        query_vector = None
         semantic = self._vector_ranking(text, since, limit)
         if semantic is not None:
-            rankings.append(semantic)
-        return self._hydrate(fuse(rankings), limit)
+            ids_, _, query_vector = semantic
+            contributors["vector"] = ids_
+            rankings.append(ids_)
+        return self._hydrate(fuse(rankings), limit, contributors, query_vector)
 
-    def _hydrate(self, scores: dict[str, float], limit: int) -> list[Hit]:
-        """Attach descriptions to scored ids, best first."""
+    def _hydrate(
+        self,
+        scores: dict[str, float],
+        limit: int,
+        contributors: dict[str, list[str]],
+        query_vector,
+    ) -> list[Hit]:
+        """Attach descriptions, similarities and provenance to scored ids (§3.2)."""
         if not scores:
             return []
         ranked = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        note_ids = [note_id for note_id, _ in ranked]
         descs = dict(
             self.db.execute(
-                f"SELECT id, desc FROM note WHERE id IN ({','.join('?' * len(ranked))})",
-                [note_id for note_id, _ in ranked],
+                f"SELECT id, desc FROM note WHERE id IN ({','.join('?' * len(note_ids))})",
+                note_ids,
             ).fetchall()
         )
-        return [Hit(note_id, descs[note_id], score) for note_id, score in ranked]
+        # Reported for every returned note, not only those the vector side
+        # ranked highly: a keyword-only hit with a low cosine is exactly the
+        # case a caller needs to see (§3.2).
+        similarity: dict[str, float] = {}
+        if query_vector is not None and self.vector_ready:
+            try:
+                similarity = vectors.similarity_for(self.db, query_vector, note_ids)
+            except Exception:  # pragma: no cover - vector side already degraded
+                similarity = {}
+        membership = {
+            note_id: tuple(
+                name for name, ranking in contributors.items() if note_id in ranking
+            )
+            for note_id in note_ids
+        }
+        return [
+            Hit(note_id, descs[note_id], score, similarity.get(note_id), membership[note_id])
+            for note_id, score in ranked
+        ]
 
     # ----------------------------------------------------------- embedding
 

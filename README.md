@@ -3,7 +3,7 @@
 A persistent note store an LLM assistant can query and write cheaply.
 Design and rationale: [`docs/seshat-mcp-spec.md`](docs/seshat-mcp-spec.md).
 
-**Built against spec version 1.1.** The version is declared in the spec header
+**Built against spec version 1.2.** The version is declared in the spec header
 and recorded as `seshat.SPEC_VERSION`; `help` and `seshat info` report it
 alongside the software and store versions, which move independently (§11.1).
 `tests/test_spec_version.py` fails if the code ever claims a revision the
@@ -139,10 +139,30 @@ candidates.
 FTS5/BM25 and vector KNN run independently and fuse with reciprocal rank
 fusion, `score = Σ 1/(k + rankᵢ)` with k=60 (§6). RRF is rank-based, so BM25
 scores and cosine distances never have to be made commensurable — there is no
-invented calibration anywhere in the path.
+invented calibration anywhere in the path. `k` is **fixed, not a knob**:
+measured invariant from 5 to 300.
 
 Sum, not maximum: a note both retrievers rank second beats a note one ranks
 first, which is the entire reason for running two of them.
+
+Each result carries three values and they are not interchangeable (§3.2):
+
+| field | what it is |
+|---|---|
+| `score` | fused rank value. **Sort key only.** A perfect match and a worthless one-token match both score ~0.016 at rank 1 |
+| `vector_similarity` | raw cosine, or null if unembedded / vector side down. The number that can actually be low |
+| `matched` | which retrievers contributed — `["fts"]`, `["vector"]`, both, or `["recency"]` |
+
+Measured against 20 queries the store cannot answer: `score` gives no signal at
+all (identical values appear in answerable and unanswerable sets), while
+`vector_similarity` medians separate 0.699 against 0.517 and an unanswerable
+query's top hit is usually vector-only. Both are triage inputs, not thresholds
+to hard-code — the ranges overlap. See `docs/retrieval-findings.md` §6b.
+
+**`context` searches content, not identifiers.** A note's id is in neither the
+FTS columns nor the embedding, so passing an id returns notes that *mention* it,
+never the note that has it. Since that is silent, an id-shaped query gets a note
+in the response pointing at `read`.
 
 **Degradation is a first-class path, not an error** (§6.3). No `sqlite-vec`, no
 Ollama, a cold model, or simply nothing embedded yet all produce the FTS
@@ -244,14 +264,15 @@ size.
 
 ### One spec claim this build could not verify
 
-§6 says omitting nomic's `search_document:` / `search_query:` prefixes, or using
+§6 (through spec 1.1) said omitting nomic's `search_document:` / `search_query:` prefixes, or using
 the same one on both sides, "degrades retrieval measurably and silently". A
 probe against the live model (15 notes, 12 queries, four prefix schemes) could
 not detect any difference — all four schemes scored within noise of each other.
 That is a **null result, not a refutation**: twelve queries cannot resolve an
 effect this size. The prefixes are the documented usage and cost nothing, so
-they will be implemented as specified when the embedder lands, but the word
-"measurably" should be treated as unverified until a real query set exists.
+they are applied as specified — but spec 1.2 withdrew the word "measurably",
+and a second attempt at 42 queries came out 3 wins to 2 losses paired, which is
+a coin flip.
 
 ## Tests
 
@@ -259,7 +280,7 @@ they will be implemented as specified when the embedder lands, but the word
 .venv/bin/python -m pytest
 ```
 
-182 tests, no network access — the embedder and the fetcher are both injected,
+198 tests, no network access — the embedder and the fetcher are both injected,
 and the server tests run the subprocess with `--no-snapshots --no-embeddings`
 so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins

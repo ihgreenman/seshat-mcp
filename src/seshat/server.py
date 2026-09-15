@@ -21,6 +21,7 @@ from pydantic import Field
 
 from . import SPEC_VERSION, __version__
 from .embeddings import DEFAULT_MODEL, OllamaEmbedder
+from .ids import looks_like_id
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .worker import EmbeddingWorker
 from .store import (
@@ -58,15 +59,32 @@ the new one:
 `why` is optional free text explaining the score."""
 
 CONTEXT_DESCRIPTION = """\
-Search the note store. Returns (id, desc, score) -- descriptions only; bodies
-are paid for individually via `read`.
+Search the note store. Returns descriptions only; bodies are paid for
+individually via `read`.
 
 `text` may be empty, in which case this is a recency listing. That is the
 session-start orientation call.
 
-The score is a fused retrieval score, not a relevance guarantee. Low-scoring
-results are in the list because they matched something, not because they are
-relevant; triage on the score."""
+Each result carries three things, and they mean different things:
+
+  score              Fused rank score. A SORT KEY ONLY -- it is derived from
+                     position, so a perfect match and a worthless one-word
+                     match both score ~0.016 at rank 1. Comparable within one
+                     result set; meaningless across them. Do NOT read it as
+                     confidence.
+  vector_similarity  Raw cosine, -1..1, or null if the note is unembedded or
+                     the vector side is unavailable. THIS is the number that
+                     can actually be low, and the one to triage on. If every
+                     result has a low similarity, the store probably holds
+                     nothing relevant -- say so rather than reporting the best
+                     of a bad list.
+  matched            Which retrievers found it: ["fts"], ["vector"], both, or
+                     ["recency"] for an empty query. A result matched only by
+                     "fts" with low similarity is a keyword coincidence.
+
+`context` searches CONTENT; it does not resolve identifiers. Passing a note id
+returns notes whose text mentions it, never the note that has it -- use `read`
+for that."""
 
 READ_DESCRIPTION = """\
 Read a note in full, with its supersession edges and its references.
@@ -219,7 +237,20 @@ def build_server(store: Store) -> MCPServer:
         limit: Annotated[int, Field(description="Maximum results.", ge=1)] = DEFAULT_LIMIT,
     ) -> dict[str, Any]:
         hits = store.context(text, since, limit)
-        return {"results": [asdict(h) for h in hits], "count": len(hits)}
+        payload: dict[str, Any] = {
+            "results": [asdict(h) for h in hits],
+            "count": len(hits),
+        }
+        if looks_like_id(text):
+            # §3.2: the division between symbol- and content-addressing is
+            # correct but silent, and this is exactly when it bites.
+            payload["note"] = (
+                f"{text!r} looks like a note id. `context` searches content and "
+                f"cannot return the note that has this id -- these results, if any, "
+                f"are notes whose text mentions it. Use `read` to fetch it, which "
+                f"also recovers from a single mistyped word."
+            )
+        return payload
 
     @server.tool(name="read", description=READ_DESCRIPTION)
     @reported
