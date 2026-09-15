@@ -1,9 +1,9 @@
 """Command line entry point. `seshat serve` is the MCP server; the rest is for
 poking a store by hand without going through an assistant.
 
-The consistency checker (spec §7) is deliberately a CLI subcommand rather than
-an MCP tool -- it is periodic maintenance, and every tool costs context on every
-turn. It is not implemented in this increment.
+`seshat check` is the consistency checker (spec §7), deliberately a CLI
+subcommand rather than an MCP tool -- it is periodic maintenance, and every tool
+costs context on every turn.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import os
 import sys
 from pathlib import Path
 
+from .checker import DEFAULT_SIMILARITY, SEVERITIES, Checker, format_report
 from .embeddings import DEFAULT_MODEL, EmbedderUnavailable, OllamaEmbedder
 from .server import default_db_path, help_payload, serve
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
@@ -47,6 +48,15 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("reindex-links", help="rebuild the derived link index (§6.5)")
     sub.add_parser("embed", help="embed every note that needs it, now")
     sub.add_parser("reembed", help="discard all embeddings and rebuild (model migration, §6.3)")
+
+    k = sub.add_parser("check", help="consistency report for human review (§7)")
+    k.add_argument("--json", action="store_true", help="machine-readable findings")
+    k.add_argument("--no-semantic", dest="semantic", action="store_false",
+                   help="structural checks only (§7.1); skips embedding comparisons")
+    k.add_argument("--similarity", type=float, default=DEFAULT_SIMILARITY,
+                   help="cosine threshold for suggested links (§7.2, open question §9.5)")
+    k.add_argument("--fail-on", default="none", choices=["none", "error", "warning", "review"],
+                   help="exit non-zero when findings at this severity or worse exist")
 
     f = sub.add_parser("fetch", help="drain the snapshot capture queue now")
     f.add_argument("--limit", type=int, default=0, help="0 means drain everything")
@@ -138,6 +148,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"cleared {store.clear_embeddings()} embeddings")
             if embedder is not None:
                 print(f"re-embedded {EmbeddingWorker(store).drain()} notes")
+        elif args.command == "check":
+            # Read-only connections of its own: the checker never mutates, and
+            # that is enforced by SQLite rather than promised in a docstring.
+            checker = Checker(
+                str(path), snapshot_path_for(path) if args.snapshots else None,
+                theta=args.theta, similarity=args.similarity,
+            )
+            try:
+                findings = checker.run(semantic=args.semantic)
+                descs = dict(store.db.execute("SELECT id, desc FROM note"))
+                total = store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0]
+                if args.json:
+                    print(json.dumps([f.as_dict() for f in findings], indent=2))
+                else:
+                    print(format_report(findings, descs, total))
+            finally:
+                checker.close()
+            if args.fail_on != "none":
+                threshold = SEVERITIES.index(args.fail_on)
+                if any(SEVERITIES.index(f.severity) <= threshold for f in findings):
+                    return 2
         elif args.command == "misses":
             rows = store.db.execute(
                 "SELECT * FROM near_miss ORDER BY hit_count DESC, first_seen LIMIT ?",

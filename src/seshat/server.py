@@ -139,7 +139,9 @@ def capability_report(store: Store) -> dict[str, Any]:
     snapshots = store.snapshots
     return {
         "vector": bool(store.vector_ready and store.embedder is not None),
-        "checker": False,
+        # Shipped, but as a CLI subcommand (`seshat check`) rather than a tool:
+        # §7 is periodic maintenance, not something needed mid-conversation.
+        "checker": True,
         "snapshots": snapshots is not None,
         # Capture is live; extraction is not. Bytes are held and hashed, so
         # `thin` (§6.6) cannot yet be assessed and is always 0 -- reporting

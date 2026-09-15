@@ -127,3 +127,22 @@ def test_extraction_is_a_pure_function_of_text():
     """This is what makes DELETE FROM link a safe rebuild (§6.6)."""
     text = "[a](https://example.com/a) and " + "f" * 64
     assert extract(text) == extract(text)
+
+
+def test_the_specs_own_example_id_is_not_a_valid_bip39_id():
+    """§6.1 illustrates ids with `bright-otter-canvas-fig`, but `otter` and `fig`
+    are not in the BIP-39 English list.
+
+    Recorded as a test because it cost real debugging time: a dangling-link
+    check appeared broken when it was correctly declining to treat a
+    non-identifier as an identifier. Anyone reaching for the spec's example as
+    test data will hit the same confusion.
+    """
+    assert "bright" in ids.WORDS and "canvas" in ids.WORDS
+    assert "otter" not in ids.WORDS and "fig" not in ids.WORDS
+    assert ids.canonicalize("bright-otter-canvas-fig") is None
+    assert extract("see bright-otter-canvas-fig for the derivation") == []
+
+    # A well-formed id made of real words is extracted.
+    assert ids.canonicalize("olive-canvas-bright-zebra") == "olive-canvas-bright-zebra"
+    assert targets("see olive-canvas-bright-zebra", kind="note") == ["olive-canvas-bright-zebra"]

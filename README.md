@@ -73,6 +73,7 @@ seshat fetch                # drain the capture queue now
 seshat reindex-links        # rebuild the derived link index (§6.5)
 seshat embed                # embed everything outstanding, now
 seshat reembed              # discard and rebuild all embeddings (model migration)
+seshat check                # consistency report for human review (§7)
 ```
 
 `seshat misses` classifies each failure, which is the point of the table:
@@ -105,6 +106,33 @@ an unfetched page is not.
 > someone edits the statement. Two tests assert the separation structurally —
 > the notes database has no `snapshot` table and the snapshot database has no
 > `link` table. Do not consolidate them.
+
+## Consistency checking
+
+`seshat check` runs §7's checks and prints a report for human review. It never
+mutates, never auto-creates edges, never auto-fixes — and that is **enforced,
+not promised**: every connection it opens is `mode=ro`, so a stray write is a
+SQLite error rather than a silent correction to someone's belief history.
+
+All ten structural checks of §7.1 plus both semantic checks of §7.2. The
+highest-value one is *orphaned retraction*: A is retracted, but some descendant
+asserted A's content at high `retained` and is itself un-superseded, so it now
+rests on something known to be wrong. That is the mechanical consequence of
+combining by maximum, and without the check §5.4's non-locality is a trap rather
+than a feature.
+
+The report ends with **where to start reading** (§7.3) — notes ranked by how
+many findings implicate them, weighted by severity. §8 argues the store must
+periodically be read in full; this says where to begin.
+
+`--no-semantic` skips the embedding comparisons, `--similarity` sets the
+suggested-link threshold (open question §9.5 — the default 0.90 is a guess),
+`--json` emits findings as data, and `--fail-on error` exits non-zero so it can
+run in a cron job.
+
+A clean report says "No findings" and explicitly **does not** claim the store is
+consistent: §7.1 validates structure, not truth, and §7.2 only generates
+candidates.
 
 ## Retrieval
 
@@ -231,7 +259,7 @@ they will be implemented as specified when the embedder lands, but the word
 .venv/bin/python -m pytest
 ```
 
-154 tests, no network access — the embedder and the fetcher are both injected,
+182 tests, no network access — the embedder and the fetcher are both injected,
 and the server tests run the subprocess with `--no-snapshots --no-embeddings`
 so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins
@@ -247,7 +275,6 @@ prefixes, strip-vs-index, vector degradation, and sum-vs-max fusion.
 - **Snapshot extraction** [§6.6] — the `thin` status cannot be assessed until
   an extractor exists, and `help` reports `snapshot_extraction: false` rather
   than letting `snapshots: true` imply it.
-- **The consistency checker** [§7] — increment 3, a CLI subcommand.
 - **The review interface** [§10] — increment 4.
 - **Growth management** [§8] — unsolved in the spec, deliberately not guessed
   at here.

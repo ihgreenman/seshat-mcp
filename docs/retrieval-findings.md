@@ -255,6 +255,20 @@ size is not evidence.** Report paired outcomes.
    policy is going to be set on evidence, that is the experiment worth building
    next, and it needs real accumulated notes rather than written-to-order ones.
 
+## 7. Unrelated, but found in the same pass
+
+**The spec's own example identifier is not a valid BIP-39 id.** §6.1 illustrates
+the scheme with `bright-otter-canvas-fig`, but `otter` and `fig` are not in the
+BIP-39 English wordlist (`bright` and `canvas` are). Anything that validates ids
+properly will refuse it.
+
+This is harmless in the document — it is an illustration, not test data — but it
+cost real debugging time here: the dangling-internal-link checker looked broken
+when it was correctly declining to treat a non-identifier as an identifier. A
+replacement made of real words, e.g. `olive-canvas-bright-zebra`, would remove
+the trap for the next implementer. Pinned in `tests/test_links.py` so it cannot
+be rediscovered a third time.
+
 ---
 
 *Evaluation harness: `scratchpad/corpus.py`, `evaluate.py`, `identifiers.py`.
