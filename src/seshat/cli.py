@@ -61,6 +61,10 @@ def _parser() -> argparse.ArgumentParser:
     ps.add_argument("--title", default=None)
     ps.add_argument("--file", type=Path, default=None, help="read text from a file (default: stdin)")
 
+    rv = sub.add_parser("review", help="local web interface for reading the store (§10)")
+    rv.add_argument("--port", type=int, default=8765)
+    rv.add_argument("--host", default="127.0.0.1", help="localhost only; §10 forbids more")
+
     rs = sub.add_parser("reset", help="archive an unopenable store and start fresh")
     rs.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
@@ -129,6 +133,12 @@ def _reset(path: Path, assume_yes: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     path = args.db or default_db_path()
+
+    if args.command == "review":
+        from .review import serve_review
+
+        serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots)
+        return 0
 
     if args.command == "reset":
         return _reset(path, args.yes)

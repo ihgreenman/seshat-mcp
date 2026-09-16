@@ -86,6 +86,7 @@ seshat extract              # read captured bytes into text (§6.6)
 seshat reextract            # re-run extraction over stored bytes
 seshat paste <id> <url>     # supply content for a failed capture (§10.2)
 seshat reset                # archive an unopenable store and start fresh
+seshat review               # local web interface for reading the store (§10)
 seshat check                # consistency report for human review (§7)
 ```
 
@@ -171,6 +172,49 @@ run in a cron job.
 A clean report says "No findings" and explicitly **does not** claim the store is
 consistent: §7.1 validates structure, not truth, and §7.2 only generates
 candidates.
+
+## Review interface
+
+```sh
+seshat --db ~/notes/seshat.db review     # http://127.0.0.1:8765
+```
+
+**Reading the store is the point** (§10.1). §8 concedes that periodic full
+reading is the only growth mitigation with a mechanism behind it, and nobody
+does that against a SQLite CLI. The home page offers the two handles the spec
+names: **open loops** (oldest notes nothing has superseded) and **most cited**
+(inbound references — the one retroactive salience measure the design has).
+Failure triage is the secondary function, not the reason it exists.
+
+Three things are enforced rather than intended:
+
+- **The notes database is opened read-only.** §10.3 requires that the UI never
+  permit editing a note and warns the absence will look like an oversight. A
+  connection that physically cannot write is not an affordance anyone relaxes by
+  accident — and the note page says why there is no edit button, rather than
+  leaving it a puzzle. Snapshot repair uses a separate writable connection to
+  the separate snapshot file.
+- **127.0.0.1 only.** Binding anything else raises; remote transport is out of
+  scope (§12) and would demand an auth model this tool has no business owning.
+- **POSTs are origin-checked and token-guarded.** "localhost is safe" stops
+  being true the moment a browser is a client — any page you visit can post to
+  127.0.0.1. §10.2 names this for the future extension; it applies the instant a
+  POST endpoint exists, which is now.
+
+### One interpretation worth knowing about
+
+§10.3 says "a snapshot that already holds content is immutable", and the paywall
+case sits exactly on that line: an interstitial *is* content, and a truthful
+record of what the URL served an anonymous fetcher. Refusing the paste would
+break §10.2's main use; allowing a blind overwrite would destroy evidence.
+
+The rule implemented: **the captured bytes are what is immutable.** A machine
+extraction is a derived reading of those bytes and can always be regenerated, so
+a human may replace it — `raw` is never touched, and `extraction='manual'`
+records who read it. A pasted reading is never replaced afterwards, because
+pasted text cannot be regenerated from anything. Both witnesses survive, which
+is what the section is protecting. Flagged here because it is an interpretation,
+not the spec's letter.
 
 ## Retrieval
 
@@ -322,7 +366,7 @@ a coin flip.
 .venv/bin/python -m pytest
 ```
 
-232 tests, no network access — the embedder and the fetcher are both injected,
+252 tests, no network access — the embedder and the fetcher are both injected,
 and the server tests run the subprocess with `--no-snapshots --no-embeddings`
 so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins
@@ -335,7 +379,6 @@ prefixes, strip-vs-index, vector degradation, and sum-vs-max fusion.
 
 ## Not yet built
 
-- **The review interface** [§10] — increment 5.
 - **The browser extension** [§10.2] — increment 6. Eliminates the capture
   deadline entirely: the browser supplies content at write time, so the gap
   between reading a page and fetching it is zero.

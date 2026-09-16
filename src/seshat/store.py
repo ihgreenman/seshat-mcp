@@ -314,8 +314,10 @@ class Store:
         theta: float = DEFAULT_THETA,
         snapshots: "SnapshotStore | None" = None,
         embedder: "Embedder | None" = None,
+        read_only: bool = False,
     ):
         self.path = str(path)
+        self.read_only = read_only
         self.theta = theta
         self.snapshots = snapshots
         self.embedder = embedder
@@ -323,21 +325,33 @@ class Store:
         self._on_captures_queued: Any = None
         self._on_note_written: Any = None
         self._vector_cooldown_until = 0.0
-        if self.path != ":memory:":
+        if self.path != ":memory:" and not read_only:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        if read_only:
+            # §10.3: the review interface must not permit editing a note. Making
+            # its connection physically read-only means the absence is not a
+            # discipline someone can reasonably relax later -- SQLite refuses.
+            if self.path != ":memory:" and not Path(self.path).exists():
+                raise StoreVersionError(f"{self.path} does not exist")
+            self.db = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, check_same_thread=False
+            )
+        else:
+            self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         # Version first, before any PRAGMA that writes. Setting journal_mode on
         # a store that is about to be refused modifies the file -- a refusal
         # that edits the thing it refused is not a refusal.
         self._check_version()
-        self.db.execute("PRAGMA foreign_keys = ON")
-        self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
+        if not read_only:
+            self.db.execute("PRAGMA foreign_keys = ON")
+            self.db.execute("PRAGMA journal_mode = WAL")
         # Optional and pre-v1, so its absence must cost nothing but quality.
         self.vector_loaded = vectors.load_extension(self.db)
-        self._ensure_schema()
-        if self.vector_loaded:
+        if not read_only:
+            self._ensure_schema()
+        if self.vector_loaded and not read_only:
             dim = embedder.dim if embedder else DEFAULT_DIM
             with self.db:
                 vectors.ensure_table(self.db, dim)
@@ -470,6 +484,9 @@ class Store:
         )
 
     def _bump_near_miss(self, key: str, candidate: str | None, distance: int | None) -> None:
+        if self.read_only:
+            # A reader observing a miss must not become a writer of one.
+            return
         with self.db:
             self.db.execute(
                 """INSERT INTO near_miss(requested, candidate, distance, first_seen, hit_count)

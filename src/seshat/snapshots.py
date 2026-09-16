@@ -38,7 +38,7 @@ from .extract import expectation_met
 
 log = logging.getLogger("seshat.snapshots")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 RAW_CAP = 8 * 1024 * 1024
 """Bytes retained per capture. Generous: this is the copy extraction re-runs
@@ -111,6 +111,22 @@ CREATE TABLE raw (
   PRIMARY KEY (note_id, target)
 );
 
+-- §10.4: some targets cannot be preserved at all -- dead before capture,
+-- DRM-protected, interaction-dependent, or purely audiovisual. The correct
+-- response is to record the failure durably and STOP RETRYING.
+--
+-- A separate table, not a column on `snapshot`: an acknowledgement is a
+-- reviewer's decision about a witness, not a property of it. The witness
+-- records what the world said and stays immutable; this records what a human
+-- concluded about it, and the two have different authors and lifetimes.
+CREATE TABLE acknowledgement (
+  note_id         TEXT NOT NULL,
+  target          TEXT NOT NULL,
+  acknowledged_at TEXT NOT NULL,
+  reason          TEXT,
+  PRIMARY KEY (note_id, target)
+);
+
 -- Durable, so a crash between write and fetch does not lose a capture that
 -- can never be taken again.
 CREATE TABLE fetch_queue (
@@ -124,6 +140,19 @@ CREATE TABLE fetch_queue (
   PRIMARY KEY (note_id, target)
 );
 """
+
+
+ADDITIVE = """
+CREATE TABLE IF NOT EXISTS acknowledgement (
+  note_id         TEXT NOT NULL,
+  target          TEXT NOT NULL,
+  acknowledged_at TEXT NOT NULL,
+  reason          TEXT,
+  PRIMARY KEY (note_id, target)
+);
+"""
+"""Tables a newer build adds to an existing snapshot database. Creation only --
+anything that would rewrite a witness belongs in a reset, not here."""
 
 
 def now() -> str:
@@ -211,9 +240,18 @@ class SnapshotStore:
             with self.db:
                 self.db.executescript(SCHEMA)
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version < SCHEMA_VERSION:
+            # Narrowly additive: new tables only, no column rewritten and no
+            # row touched. That is a different and much safer class of change
+            # than altering `snapshot`, which holds witnesses that cannot be
+            # regenerated -- so it is allowed here and refused there.
+            with self.db:
+                self.db.executescript(ADDITIVE)
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif version != SCHEMA_VERSION:
             raise RuntimeError(
-                f"snapshot store {self.path} is version {version}, build speaks {SCHEMA_VERSION}"
+                f"snapshot store {self.path} is version {version}, newer than this "
+                f"build's {SCHEMA_VERSION}. Upgrade seshat."
             )
 
     def close(self) -> None:
@@ -438,8 +476,20 @@ class SnapshotStore:
 
         Clears the whole paywall/SSO/SPA class of failure without seshat ever
         handling a credential: the user is already authenticated and already
-        looking at the page. Filling a failed capture is not a rewrite -- there
-        was no content there to destroy.
+        looking at the page.
+
+        §10.3 says a snapshot holding content is immutable, and the paywall case
+        sits exactly on that line: the interstitial IS content, and a truthful
+        record of what the URL served an anonymous fetcher. The resolution is
+        that **`raw` is never touched**. The bytes the fetcher received stay
+        exactly where they were, so nothing is destroyed; only the derived
+        reading is replaced, by a better one, with `extraction='manual'` saying
+        who read it. Both witnesses survive, which is what the spec is
+        protecting.
+
+        A previous *manual* paste is never replaced. Pasted text cannot be
+        regenerated from anything, so overwriting it would be the real loss
+        §10.3 forbids.
         """
         from .extract import MANUAL as MANUAL_MARK
         from .extract import TEXT_CAP, Extraction
@@ -457,8 +507,8 @@ class SnapshotStore:
             self.db.execute(
                 """UPDATE snapshot SET extraction = NULL
                    WHERE note_id = ? AND target = ?
-                     AND status IN ('thin', 'unreachable', 'gone')""",
-                (note_id, target),
+                     AND (extraction IS NULL OR extraction NOT LIKE ?)""",
+                (note_id, target, MANUAL + "%"),
             )
         return self.store_extraction(note_id, target, extraction, status="ok")
 
@@ -490,6 +540,94 @@ class SnapshotStore:
             out.append(item)
         return out
 
+    # ------------------------------------------------------------- triage
+
+    def acknowledge(self, note_id: str, target: str, reason: str | None = None) -> None:
+        """Record that a target is irreducibly unpreservable (§10.4).
+
+        The note remains valid. It cites a source nobody can check, which is a
+        property of the snapshot and weaker evidence -- not a defect in the
+        note, and never grounds for superseding it.
+        """
+        with self._lock, self.db:
+            self.db.execute(
+                """INSERT INTO acknowledgement(note_id, target, acknowledged_at, reason)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(note_id, target) DO UPDATE SET
+                     acknowledged_at = excluded.acknowledged_at, reason = excluded.reason""",
+                (note_id, target, now(), reason),
+            )
+            self.db.execute(
+                "DELETE FROM fetch_queue WHERE note_id = ? AND target = ?", (note_id, target)
+            )
+
+    def acknowledged(self) -> set[tuple[str, str]]:
+        with self._lock:
+            return {
+                (r["note_id"], r["target"])
+                for r in self.db.execute("SELECT note_id, target FROM acknowledgement")
+            }
+
+    def retry(self, note_id: str, target: str) -> bool:
+        """Re-queue a transient failure (§10.2). Only failures: a successful
+        capture is immutable and re-fetching it would be pointless."""
+        with self._lock, self.db:
+            row = self.db.execute(
+                """SELECT status, expectation, expectation_source FROM snapshot
+                   WHERE note_id = ? AND target = ?""",
+                (note_id, target),
+            ).fetchone()
+            if row is None or row["status"] == "ok":
+                return False
+            self.db.execute(
+                "DELETE FROM snapshot WHERE note_id = ? AND target = ?", (note_id, target)
+            )
+            self.db.execute(
+                "DELETE FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
+            )
+            self.db.execute(
+                """INSERT OR REPLACE INTO fetch_queue(
+                       note_id, target, enqueued_at, attempts, expectation, expectation_source)
+                   VALUES (?, ?, ?, 0, ?, ?)""",
+                (note_id, target, now(), row["expectation"], row["expectation_source"]),
+            )
+        return True
+
+    def failures(self) -> list[dict]:
+        """The triage queue (§10.2): captures needing a human, worst first.
+
+        Acknowledged targets are excluded -- that is what acknowledging is for.
+        """
+        acknowledged = self.acknowledged()
+        with self._lock:
+            rows = self.db.execute(
+                """SELECT note_id, target, status, captured_at, expectation,
+                          expectation_source, text, full_length, final_url, http_status
+                   FROM snapshot WHERE status != 'ok' ORDER BY captured_at DESC"""
+            ).fetchall()
+        order = {"thin": 0, "unreachable": 1, "gone": 2}
+        out = [dict(r) for r in rows if (r["note_id"], r["target"]) not in acknowledged]
+        out.sort(key=lambda r: (order.get(r["status"], 9), r["captured_at"]))
+        return out
+
+    def unmet_expectations(self) -> list[dict]:
+        """Captures that succeeded structurally but may be the wrong page (§6.9).
+
+        Candidates for review, never verdicts.
+        """
+        acknowledged = self.acknowledged()
+        with self._lock:
+            rows = self.db.execute(
+                """SELECT note_id, target, expectation, expectation_source, text, full_length
+                   FROM snapshot
+                   WHERE status = 'ok' AND expectation IS NOT NULL AND text IS NOT NULL"""
+            ).fetchall()
+        return [
+            dict(r) for r in rows
+            if (r["note_id"], r["target"]) not in acknowledged
+            and expectation_met(r["expectation"], r["text"]) is False
+        ]
+
     def histogram(self) -> dict[str, int]:
         """§3.6: a histogram, not a counter.
 
@@ -512,6 +650,10 @@ class SnapshotStore:
         # Not in the spec's minimum shape: this build holds bytes it has not
         # parsed, and reporting those as plain `ok` would overstate what exists.
         result["unextracted"] = unextracted
+        with self._lock:
+            result["acknowledged"] = self.db.execute(
+                "SELECT COUNT(*) FROM acknowledgement"
+            ).fetchone()[0]
         return result
 
 

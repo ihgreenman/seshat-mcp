@@ -422,11 +422,18 @@ def test_reextraction_refreshes_machine_extractions(linked):
     assert linked.snapshots.sources_for(note_id)[0]["text"] == "Original prose."
 
 
-def test_pasting_does_not_rewrite_a_good_capture(linked):
-    """A snapshot that already holds content is immutable like the note it
-    witnesses (§10.3)."""
+def test_the_captured_bytes_are_what_is_immutable(linked):
+    """§10.3, as resolved for the paywall case (see test_review.py).
+
+    A machine extraction is a derived reading and can be regenerated from the
+    stored bytes, so a human may replace it. The bytes themselves never change
+    -- they are the witness, and they cannot be re-fetched.
+    """
     note_id, _ = linked.create_note("a claim", "https://example.com/a")
     SnapshotWorker(linked.snapshots, fetcher=ok(b"<p>The captured text.</p>")).run_once()
+    before = linked.snapshots.db.execute("SELECT body_hash FROM raw").fetchone()["body_hash"]
 
-    assert linked.snapshots.paste(note_id, "https://example.com/a", "different text") is False
-    assert linked.snapshots.sources_for(note_id)[0]["text"] == "The captured text."
+    assert linked.snapshots.paste(note_id, "https://example.com/a", "a human reading") is True
+    assert linked.snapshots.sources_for(note_id)[0]["text"] == "a human reading"
+    assert linked.snapshots.db.execute(
+        "SELECT body_hash FROM raw").fetchone()["body_hash"] == before
