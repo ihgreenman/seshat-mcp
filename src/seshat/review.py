@@ -26,6 +26,7 @@ Stdlib only, server-rendered, no JavaScript and no external assets.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import secrets
 import threading
@@ -34,6 +35,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import SPEC_VERSION, __version__
 from .checker import Checker, reading_guide
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .store import Store
@@ -91,18 +93,52 @@ def _h(value) -> str:
     return E(str(value)) if value is not None else ""
 
 
+def token_path(db_path: Path) -> Path:
+    return Path(str(db_path) + ".token")
+
+
+def load_token(db_path: Path) -> str:
+    """The shared secret between this interface and the browser extension.
+
+    Persisted, unlike the per-process form token: an extension that had to be
+    re-paired every restart would be re-paired carelessly. Written 0600 -- it is
+    the only thing standing between any page you visit and your note store.
+    """
+    path = token_path(db_path)
+    if path.exists():
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    token = secrets.token_urlsafe(32)
+    path.write_text(token + "\n")
+    path.chmod(0o600)
+    return token
+
+
 class Review:
     """Everything the handler needs, built once and shared across requests."""
 
-    def __init__(self, db_path: Path, snapshots: bool = True):
+    def __init__(self, db_path: Path, snapshots: bool = True, capture_api: bool = True):
         self.db_path = Path(db_path)
         self.store = Store(self.db_path, read_only=True)
         self.snapshots = SnapshotStore(snapshot_path_for(self.db_path)) if snapshots else None
         # Regenerated per process: a form from a previous run is not a form.
         self.token = secrets.token_urlsafe(24)
+        # Persistent, for the extension, which cannot re-pair on every restart.
+        self.api_token = load_token(self.db_path) if capture_api else None
+
+        # §10.3 forbids EDITING a note; §6.10 makes the extension "a second
+        # front door to note()", which is creation. So the UI keeps its
+        # read-only connection and creation gets its own, used by exactly one
+        # endpoint. No code path anywhere can update an existing note.
+        self.writer: Store | None = None
+        if capture_api:
+            self.writer = Store(self.db_path, snapshots=self.snapshots)
 
     def close(self) -> None:
         self.store.close()
+        if self.writer is not None:
+            self.writer.close()
         if self.snapshots is not None:
             self.snapshots.close()
 
@@ -445,11 +481,139 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    # --------------------------------------------------------- extension API
+
+    def _api_authorised(self) -> bool:
+        """Token in the Authorization header, and an origin we recognise.
+
+        The token is the real boundary -- it is a 0600 file on disk. Origin
+        checking is the second half §10.2 asks for: it costs nothing and it
+        stops an ordinary web page from reaching the endpoint at all, leaving
+        only installed extensions and local tools as possible callers.
+        """
+        review = self.review
+        if review.api_token is None:
+            return False
+        header = self.headers.get("Authorization", "")
+        supplied = header[7:] if header.lower().startswith("bearer ") else ""
+        if not secrets.compare_digest(supplied, review.api_token):
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        host = self.headers.get("Host", "")
+        return (
+            origin.startswith(("chrome-extension://", "moz-extension://", "safari-web-extension://"))
+            or origin in (f"http://{host}", f"https://{host}")
+        )
+
+    def _cors(self, origin: str | None):
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Vary", "Origin")
+
+    def _json(self, payload: dict, status: int = 200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self._cors(self.headers.get("Origin"))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):  # noqa: N802
+        self.send_response(204)
+        self._cors(self.headers.get("Origin"))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _api(self, action: str, payload: dict) -> tuple[dict, int]:
+        review = self.review
+        if action == "ping":
+            return {
+                "ok": True,
+                "spec_version": SPEC_VERSION,
+                "software_version": __version__,
+                "capture": review.writer is not None,
+                "snapshots": review.snapshots is not None,
+            }, 200
+
+        if action == "capture":
+            # §6.10: this writes A NOTE with the page attached as evidence --
+            # not an unattached capture awaiting a note. Notes stay primary.
+            desc = (payload.get("desc") or "").strip()
+            url = (payload.get("url") or "").strip()
+            if not desc or not url:
+                return {"error": "desc and url are required"}, 400
+            if review.writer is None:
+                return {"error": "capture API disabled"}, 400
+
+            detail = (payload.get("detail") or "").strip()
+            body = f"{detail}\n\n" if detail else ""
+            # The citation carries the desc as anchor text, which is exactly
+            # §6.9's expectation: what was sought here, stated in the act of
+            # citing. The capture then satisfies or fails it immediately.
+            body += f"Source: [{desc}]({url})"
+            note_id, _ = review.writer.create_note(desc, body)
+
+            if review.snapshots is not None:
+                review.snapshots.record_browser(
+                    note_id,
+                    url,
+                    payload.get("text") or "",
+                    (payload.get("html") or "").encode("utf-8") or None,
+                    payload.get("title"),
+                    expectation=desc,
+                )
+                sources = [
+                    s for s in review.snapshots.sources_for(note_id) if s["target"] == url
+                ]
+                status = sources[0]["status"] if sources else "none"
+            else:
+                status = "none"
+            return {"id": note_id, "snapshot_status": status}, 200
+
+        if action == "repair":
+            if review.snapshots is None:
+                return {"error": "snapshots disabled"}, 400
+            note_id = (payload.get("note_id") or "").strip()
+            target = (payload.get("target") or "").strip()
+            text = payload.get("text") or ""
+            if not (note_id and target and text.strip()):
+                return {"error": "note_id, target and text are required"}, 400
+            saved = review.snapshots.record_browser(
+                note_id, target, text,
+                (payload.get("html") or "").encode("utf-8") or None,
+                payload.get("title"),
+            )
+            return {"ok": saved}, 200
+
+        if action == "targets":
+            # Lets the extension say "this page is in your triage queue" while
+            # you happen to be looking at it -- the cheapest possible repair.
+            if review.snapshots is None:
+                return {"targets": []}, 200
+            rows = review.snapshots.failures() + review.snapshots.unmet_expectations()
+            return {"targets": [
+                {"note_id": r["note_id"], "target": r["target"],
+                 "status": r.get("status", "expectation")}
+                for r in rows
+            ]}, 200
+
+        return {"error": "unknown action"}, 404
+
     def do_GET(self):  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
         params = urllib.parse.parse_qs(parsed.query)
         r = self.review
+        if parts and parts[0] == "api":
+            if not self._api_authorised():
+                return self._json({"error": "unauthorised"}, 401)
+            payload, status = self._api(parts[1] if len(parts) > 1 else "", {})
+            return self._json(payload, status)
         try:
             if not parts:
                 return self._send(page("Home", render_home(r), r))
@@ -486,6 +650,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         r = self.review
+        parts = [p for p in urllib.parse.urlparse(self.path).path.split("/") if p]
+        if parts and parts[0] == "api":
+            if not self._api_authorised():
+                return self._json({"error": "unauthorised"}, 401)
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._json({"error": "invalid json"}, 400)
+            try:
+                result, status = self._api(parts[1] if len(parts) > 1 else "", payload)
+            except Exception as exc:
+                log.exception("api action failed")
+                return self._json({"error": str(exc)}, 500)
+            return self._json(result, status)
+
         length = int(self.headers.get("Content-Length") or 0)
         fields = urllib.parse.parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         if not self._origin_ok() or fields.get("token", [""])[0] != r.token:
@@ -513,9 +693,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve_review(
-    db_path: Path, port: int = 8765, host: str = "127.0.0.1", snapshots: bool = True
+    db_path: Path,
+    port: int = 8765,
+    host: str = "127.0.0.1",
+    snapshots: bool = True,
+    capture_api: bool = True,
 ) -> None:
-    review = Review(db_path, snapshots=snapshots)
+    review = Review(db_path, snapshots=snapshots, capture_api=capture_api)
     if host not in ("127.0.0.1", "localhost", "::1"):
         # §10/§12: remote transport is out of scope, and binding wider would
         # demand an auth model this tool has no business owning.
@@ -524,6 +708,8 @@ def serve_review(
     handler = type("BoundHandler", (Handler,), {"review": review})
     httpd = ThreadingHTTPServer((host, port), handler)
     log.info("review interface: http://%s:%d (notes read-only)", host, port)
+    if review.api_token:
+        log.info("extension API enabled; token in %s", token_path(review.db_path))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:

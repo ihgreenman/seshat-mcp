@@ -64,6 +64,10 @@ def _parser() -> argparse.ArgumentParser:
     rv = sub.add_parser("review", help="local web interface for reading the store (§10)")
     rv.add_argument("--port", type=int, default=8765)
     rv.add_argument("--host", default="127.0.0.1", help="localhost only; §10 forbids more")
+    rv.add_argument("--no-capture-api", dest="capture_api", action="store_false",
+                    help="serve the UI only; refuse the browser extension's endpoints")
+
+    sub.add_parser("token", help="print the browser extension's API token (§10.2)")
 
     rs = sub.add_parser("reset", help="archive an unopenable store and start fresh")
     rs.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
@@ -137,7 +141,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "review":
         from .review import serve_review
 
-        serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots)
+        serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots,
+                     capture_api=args.capture_api)
+        return 0
+
+    if args.command == "token":
+        from .review import load_token, token_path
+
+        print(load_token(path))
+        print(f"stored 0600 in {token_path(path)}", file=sys.stderr)
+        print("paste into the extension's options page; it is the only thing between",
+              file=sys.stderr)
+        print("any page you visit and your note store", file=sys.stderr)
         return 0
 
     if args.command == "reset":

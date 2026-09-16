@@ -87,6 +87,7 @@ seshat reextract            # re-run extraction over stored bytes
 seshat paste <id> <url>     # supply content for a failed capture (§10.2)
 seshat reset                # archive an unopenable store and start fresh
 seshat review               # local web interface for reading the store (§10)
+seshat token                # print the browser extension's API token
 seshat check                # consistency report for human review (§7)
 ```
 
@@ -215,6 +216,28 @@ records who read it. A pasted reading is never replaced afterwards, because
 pasted text cannot be regenerated from anything. Both witnesses survive, which
 is what the section is protecting. Flagged here because it is an interpretation,
 not the spec's letter.
+
+## Browser extension
+
+`extension/` is a Manifest V3 extension implementing §10.2's two jobs: **capture**
+(read a page, write the note there and then, DOM attached) and **repair** (open
+the page you are already authenticated on, click once). See
+[`extension/README.md`](extension/README.md) to install it.
+
+**It removes the capture deadline rather than reducing friction.** §6.6's
+deadline exists because of the gap between reading a page and fetching it
+afterwards; through the extension that gap is zero, so nothing is queued, `thin`
+is decidable immediately, and the recovery window never opens.
+
+It writes a note with evidence attached — a second front door to `note()`, not a
+new model — and then **stops**. There is no "and what do you think?" prompt,
+because a capture and an analysis are deliberately separate notes (§6.10). The
+popup asks *what the page told you*, not what the page is.
+
+Enable/disable with `seshat review --no-capture-api`; `seshat token` prints the
+shared secret. The endpoints require a bearer token **and** a recognised origin,
+so an ordinary web page is refused even holding the token — "localhost is safe"
+stops being true the moment a browser is a client.
 
 ## Retrieval
 
@@ -366,7 +389,7 @@ a coin flip.
 .venv/bin/python -m pytest
 ```
 
-252 tests, no network access — the embedder and the fetcher are both injected,
+265 tests, no network access — the embedder and the fetcher are both injected,
 and the server tests run the subprocess with `--no-snapshots --no-embeddings`
 so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins
@@ -379,11 +402,18 @@ prefixes, strip-vs-index, vector degradation, and sum-vs-max fusion.
 
 ## Not yet built
 
-- **The browser extension** [§10.2] — increment 6. Eliminates the capture
-  deadline entirely: the browser supplies content at write time, so the gap
-  between reading a page and fetching it is zero.
-- **Growth management** [§8] — unsolved in the spec, deliberately not guessed
-  at here.
+All six increments of §11.3 are implemented. What remains is not code:
+
+- **Growth management** [§8] — unsolved in the spec, and deliberately not
+  guessed at here. Inbound reference count and open-loop listing are surfaced
+  in the review interface as the two handles the spec names; automated pruning
+  waits on real usage.
+- **θ** [§9.2] and **the suggested-link similarity threshold** [§9.5] — both
+  wait on the near-duplicate regime, which §9.5 says not to synthesise. The
+  store is running; the real thing arrives on its own.
+- **A better extractor** — the stdlib one leaks boilerplate on sites that use
+  `div`s rather than semantic elements. It records a version, so switching to
+  `trafilatura` is `seshat reextract` over stored bytes, not a migration.
 
 ## License
 

@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>seshat capture — settings</title>
+<style>
+  body { font: 15px/1.6 system-ui, sans-serif; max-width: 34rem; margin: 2rem auto; padding: 0 1rem; }
+  label { display: block; margin: 1rem 0 .25rem; font-weight: 600; }
+  input { width: 100%; padding: .5rem; font: inherit; box-sizing: border-box; }
+  p.dim { color: #666; font-size: 13px; }
+  code { background: #f2f2ef; padding: .1rem .3rem; border-radius: 3px; }
+</style>
+<h1>seshat capture</h1>
+<label for="endpoint">Endpoint</label>
+<input id="endpoint" type="url" placeholder="http://127.0.0.1:8765">
+<p class="dim">Wherever <code>seshat review</code> is listening. Localhost only —
+seshat refuses to bind anything else.</p>
+<label for="token">Token</label>
+<input id="token" type="password" placeholder="paste the token">
+<p class="dim">Run <code>seshat token</code> to print it, or read
+<code>&lt;your-store&gt;.db.token</code>. It is the only thing standing between
+any page you visit and your note store, so it is stored 0600 on disk and is
+never sent anywhere but your endpoint.</p>
+<p><button id="save">Save</button> <span id="status" class="dim"></span></p>
+<script src="options.js"></script>

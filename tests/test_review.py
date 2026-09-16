@@ -5,6 +5,7 @@ here are properties of the interface -- what it refuses, what it cannot do --
 and testing the render functions directly would skip exactly those.
 """
 
+import json
 import threading
 import urllib.error
 import urllib.parse
@@ -358,3 +359,227 @@ def test_a_manual_paste_is_never_replaced_by_another(server):
     source = next(s for s in review.snapshots.sources_for(note_id)
                   if s["target"] == "https://example.gov/tx")
     assert source["text"] == "first paste, carefully checked"
+
+
+# ------------------------------------------- §6.10 / §10.2 the extension API
+
+
+def api(base, path, payload=None, token=None, origin=None, method=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    request = urllib.request.Request(
+        base + path, data=data, method=method or ("POST" if data else "GET")
+    )
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    if origin:
+        request.add_header("Origin", origin)
+    if data:
+        request.add_header("Content-Type", "application/json")
+    status, body = _fetch(request)
+    try:
+        return status, json.loads(body)
+    except ValueError:
+        return status, {"raw": body}
+
+
+def test_the_api_requires_a_token(server):
+    base, review, _, _ = server
+    assert api(base, "/api/ping")[0] == 401
+    assert api(base, "/api/ping", token="wrong")[0] == 401
+    assert api(base, "/api/ping", token=review.api_token)[0] == 200
+
+
+def test_an_ordinary_web_page_cannot_reach_the_api(server):
+    """Token plus origin, per §10.2. Even holding the token, a page on the open
+    web is not a caller this endpoint recognises."""
+    base, review, _, _ = server
+    status, _ = api(base, "/api/ping", token=review.api_token,
+                    origin="https://evil.example")
+    assert status == 401
+
+
+def test_an_extension_origin_is_accepted(server):
+    base, review, _, _ = server
+    status, body = api(base, "/api/ping", token=review.api_token,
+                       origin="chrome-extension://abcdefghijklmnop")
+    assert status == 200 and body["capture"] is True
+
+
+def test_capture_writes_a_note_with_the_page_attached(server):
+    """§6.10: the extension is a second front door to note(), not a new model.
+    What it writes is a note with evidence attached -- not an unattached capture
+    awaiting a note."""
+    base, review, _, _ = server
+    status, body = api(base, "/api/capture", {
+        "desc": "Prewarping is exact at only one frequency",
+        "detail": "the match holds at the chosen wc and nowhere else",
+        "url": "https://example.org/bilinear",
+        "title": "Bilinear transform",
+        "text": "The bilinear transform compresses the frequency axis. Prewarping is "
+                "exact at only one frequency, the one you choose, and nowhere else.",
+        "html": "<html><body><p>Prewarping is exact at only one frequency.</p></body></html>",
+    }, token=review.api_token)
+
+    assert status == 200
+    note_id = body["id"]
+    record = review.store.read(note_id)
+    assert record.desc == "Prewarping is exact at only one frequency"
+    assert "https://example.org/bilinear" in record.text
+
+    source = review.snapshots.sources_for(note_id)[0]
+    assert source["provenance"] == "browser", "§10.2 provenance is three-valued"
+    assert "compresses the frequency axis" in source["text"]
+
+
+def test_a_browser_capture_never_queues_a_fetch(server):
+    """§6.10's main argument for building this: the browser supplies content at
+    write time, so the gap that rot and drift live in is zero. `pending` never
+    rises on this path and the recovery window never opens."""
+    base, review, _, _ = server
+    before = len(review.snapshots.pending())
+    api(base, "/api/capture", {
+        "desc": "a finding", "url": "https://example.org/live",
+        "text": "Plenty of real content on this page, captured from the rendered DOM.",
+        "html": "<html><body>content</body></html>",
+    }, token=review.api_token)
+
+    assert len(review.snapshots.pending()) == before, "nothing queued"
+    assert review.snapshots.histogram()["pending"] == before
+
+
+def test_capture_sets_the_expectation_from_what_you_said(server):
+    """The desc is both the note's handle and §6.9's expectation -- you say what
+    the page told you, and the capture is immediately checkable against it."""
+    base, review, _, _ = server
+    _, body = api(base, "/api/capture", {
+        "desc": "wireguard handshake fails behind symmetric NAT",
+        "url": "https://example.org/wg",
+        "text": "The wireguard handshake fails behind symmetric NAT unless one peer "
+                "has a stable endpoint or you run a relay.",
+        "html": "<html><body>x</body></html>",
+    }, token=review.api_token)
+
+    source = review.snapshots.sources_for(body["id"])[0]
+    assert source["expectation"] == "wireguard handshake fails behind symmetric NAT"
+    assert source["expectation_met"] is True
+
+
+def test_a_thin_browser_capture_is_reported_back_immediately(server):
+    """`thin` is decidable at once on this path, so the popup can say so while
+    you are still looking at the page."""
+    base, review, _, _ = server
+    _, body = api(base, "/api/capture", {
+        "desc": "a finding", "url": "https://example.org/spa",
+        "text": "", "html": "<html><body><div id=root></div>" + "x" * 5000 + "</body></html>",
+    }, token=review.api_token)
+    assert body["snapshot_status"] == "thin"
+
+
+def test_capture_requires_a_desc(server):
+    """§6.10: the extension should prompt for what the page told you. A capture
+    with nothing said about it is a bookmark."""
+    base, review, _, _ = server
+    status, _ = api(base, "/api/capture", {"url": "https://example.org/x"},
+                    token=review.api_token)
+    assert status == 400
+
+
+def test_the_api_cannot_edit_a_note(server):
+    """§10.3 holds on this path too: creation is a front door to note(),
+    updating is not a thing that exists anywhere."""
+    base, review, _, _ = server
+    _, body = api(base, "/api/capture", {
+        "desc": "original", "url": "https://example.org/a", "text": "content here",
+    }, token=review.api_token)
+    for action in ("update", "edit", "delete"):
+        assert api(base, f"/api/{action}", {"id": body["id"]},
+                   token=review.api_token)[0] == 404
+
+
+def test_repair_uses_the_page_you_are_looking_at(server):
+    """§10.2's other job: something failed, go to the page, click."""
+    base, review, _, _ = server
+    note_id = next(r["note_id"] for r in review.snapshots.unmet_expectations())
+    status, body = api(base, "/api/repair", {
+        "note_id": note_id, "target": "https://example.gov/tx",
+        "text": "Texas population data by county, 2020 through 2025.",
+        "html": "<html><body>real content</body></html>",
+    }, token=review.api_token)
+
+    assert status == 200 and body["ok"] is True
+    source = next(s for s in review.snapshots.sources_for(note_id)
+                  if s["target"] == "https://example.gov/tx")
+    assert source["provenance"] == "browser"
+    assert source["expectation_met"] is True
+
+
+def test_targets_tells_the_extension_what_needs_repair(server):
+    base, review, _, _ = server
+    status, body = api(base, "/api/targets", token=review.api_token)
+    assert status == 200
+    assert any(t["target"] == "https://example.gov/tx" for t in body["targets"])
+
+
+def test_the_api_can_be_refused_entirely(tmp_path):
+    """A user who only wants to browse should not be running a write endpoint."""
+    Store(tmp_path / "n.db").close()
+    review = Review(tmp_path / "n.db", snapshots=False, capture_api=False)
+    try:
+        assert review.writer is None
+        assert review.api_token is None
+    finally:
+        review.close()
+
+
+def test_the_token_file_is_not_world_readable(tmp_path):
+    from seshat.review import load_token, token_path
+
+    Store(tmp_path / "n.db").close()
+    load_token(tmp_path / "n.db")
+    assert token_path(tmp_path / "n.db").stat().st_mode & 0o077 == 0
+
+
+def test_a_human_reading_is_never_replaced_by_another(server):
+    """The rule stated once in `_clear_machine_reading`: replaceable exactly
+    when regenerable, and only a fetch reading is. A browser reading that
+    repaired a fetch is NOT regenerable -- `raw` still holds the fetcher's
+    bytes, so re-extracting would give back the paywall, not the reading."""
+    base, review, _, _ = server
+    note_id = next(r["note_id"] for r in review.snapshots.unmet_expectations())
+    target = "https://example.gov/tx"
+
+    api(base, "/api/repair", {
+        "note_id": note_id, "target": target,
+        "text": "The careful reading, taken with the page open.",
+        "html": "<html><body>real</body></html>",
+    }, token=review.api_token)
+
+    # A second attempt, browser or paste, must not overwrite it.
+    api(base, "/api/repair", {
+        "note_id": note_id, "target": target, "text": "a careless second pass",
+    }, token=review.api_token)
+    assert review.snapshots.paste(note_id, target, "and a careless third") is False
+
+    source = next(s for s in review.snapshots.sources_for(note_id) if s["target"] == target)
+    assert source["text"] == "The careful reading, taken with the page open."
+
+
+def test_a_repair_leaves_the_fetchers_bytes_as_captured(server):
+    """What the URL served an anonymous fetcher stays on the record even after
+    a human supplies a better reading. Both witnesses survive."""
+    base, review, _, _ = server
+    note_id = next(r["note_id"] for r in review.snapshots.unmet_expectations())
+    target = "https://example.gov/tx"
+    before = review.snapshots.db.execute(
+        "SELECT body_hash FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
+    ).fetchone()["body_hash"]
+
+    api(base, "/api/repair", {
+        "note_id": note_id, "target": target, "text": "the real article",
+        "html": "<html><body>real</body></html>",
+    }, token=review.api_token)
+
+    after = review.snapshots.db.execute(
+        "SELECT body_hash FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
+    ).fetchone()["body_hash"]
+    assert after == before

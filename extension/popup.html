@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Capture to seshat</title>
+<style>
+  :root { --fg:#1b1b1a; --dim:#6b6b66; --line:#dcdcd6; --bg:#fff; --bad:#8a2222; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e6e2; --dim:#9a9a92; --line:#2e2e34; --bg:#1e1e24; --bad:#e08a7a; }
+  }
+  body { font: 14px/1.5 system-ui, sans-serif; width: 26rem; margin: 0; padding: 1rem;
+         color: var(--fg); background: var(--bg); }
+  h1 { font-size: 14px; margin: 0 0 .25rem; }
+  .url { font: 12px ui-monospace, monospace; color: var(--dim); word-break: break-all;
+         margin-bottom: .75rem; }
+  label { display: block; font-weight: 600; margin: .75rem 0 .2rem; }
+  .hint { color: var(--dim); font-size: 12px; font-weight: 400; }
+  input, textarea { width: 100%; padding: .5rem; font: inherit; box-sizing: border-box;
+                    border: 1px solid var(--line); border-radius: 5px;
+                    background: var(--bg); color: var(--fg); }
+  textarea { min-height: 5rem; resize: vertical; }
+  button { font: inherit; padding: .45rem 1rem; border: 1px solid var(--line);
+           border-radius: 5px; background: var(--bg); color: var(--fg); cursor: pointer; }
+  #status { margin-top: .6rem; font-size: 13px; color: var(--dim); }
+  #status.bad { color: var(--bad); }
+  .queued { border: 1px solid var(--line); border-radius: 5px; padding: .5rem;
+            margin-bottom: .75rem; font-size: 13px; }
+</style>
+<h1>What did this page tell you?</h1>
+<div class="url" id="url"></div>
+<div id="queued" class="queued" hidden></div>
+
+<label for="desc">The finding
+  <span class="hint">— what you learned, not what the page is. This becomes the
+  note's handle, and it is the only thing retrieval shows you later.</span>
+</label>
+<input id="desc" placeholder="Bilinear transform loses precision near Nyquist">
+
+<label for="detail">Detail <span class="hint">— optional</span></label>
+<textarea id="detail" placeholder="the part that mattered"></textarea>
+
+<p style="margin:.9rem 0 0"><button id="save">Capture</button></p>
+<div id="status"></div>
+<p class="hint" style="margin-top:.8rem">
+  This writes the capture note and stops. What follows from it is a separate
+  thought — write that in conversation, referencing this note's id.
+</p>
+<script src="popup.js"></script>

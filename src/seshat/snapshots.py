@@ -471,6 +471,96 @@ class SnapshotStore:
             )
             return cursor.rowcount
 
+    def _clear_machine_reading(self, note_id: str, target: str) -> None:
+        """Make room for a human-supplied reading, without losing anything.
+
+        The rule, in one place so it cannot drift between the paste path and
+        the extension path: **a reading is replaceable exactly when it can be
+        regenerated**, and only a `fetch:` reading can. `raw` holds the bytes it
+        was read from, those bytes are never touched, and re-running the
+        extractor reproduces it exactly.
+
+        Nothing human-supplied is replaceable. A pasted reading arrived by hand
+        and nothing in the store can reproduce it. A browser reading looks
+        regenerable but is not, in the case that matters: when it repairs an
+        earlier fetch, `raw` still holds the *fetcher's* bytes -- the paywall
+        interstitial -- because those are the original witness and are not
+        overwritten. Regenerating from them would give back the paywall, not
+        the reading. Treating browser readings as replaceable would have been a
+        rule that is true in the fresh-capture case and quietly false in the
+        repair case.
+
+        The cost is that a careless paste cannot be corrected through this
+        path. That is the conservative failure, and the right one for a table
+        whose whole purpose is to hold evidence.
+        """
+        self.db.execute(
+            """UPDATE snapshot SET extraction = NULL
+               WHERE note_id = ? AND target = ?
+                 AND (extraction IS NULL OR extraction LIKE ?)""",
+            (note_id, target, FETCH + ":%"),
+        )
+
+    def record_browser(
+        self,
+        note_id: str,
+        target: str,
+        text: str,
+        html: bytes | None = None,
+        title: str | None = None,
+        expectation: str | None = None,
+    ) -> bool:
+        """Attach a browser capture as evidence for a note (§10.2, §6.10).
+
+        **This path has no fetch deadline at all.** §6.6's deadline exists
+        because of the gap between reading a page and fetching it afterwards,
+        which is where rot and drift live. The browser supplies content at write
+        time, so the gap is zero: nothing is queued, `pending` never rises,
+        `thin` is decidable immediately, and §10.2's recovery window never opens.
+
+        The DOM is kept as `raw` where supplied, so extraction stays re-runnable
+        exactly as it is for a fetch -- but note the provenance difference §10.2
+        draws: a rendered DOM is better fidelity *and* rendered for that viewer,
+        personalisation and A/B bucketing included.
+        """
+        from .extract import BROWSER_PREFIX, TEXT_CAP, Extraction, is_thin
+
+        body = text.strip()
+        extraction = Extraction(
+            title=title,
+            text=body[:TEXT_CAP],
+            full_length=len(body),
+            extractor=f"{BROWSER_PREFIX}dom/1",
+        )
+        raw_length = len(html) if html else len(body.encode("utf-8"))
+        thin = is_thin(len(body), raw_length)
+        stamp = now()
+        with self._lock, self.db:
+            self.db.execute(
+                """INSERT OR IGNORE INTO snapshot(
+                       note_id, target, captured_at, status, raw_length, expectation,
+                       expectation_source, http_status)
+                   VALUES (?, ?, ?, ?, ?, ?, 'anchor', NULL)""",
+                (note_id, target, stamp, "thin" if thin else "ok", raw_length, expectation),
+            )
+            if html:
+                self.db.execute(
+                    """INSERT OR IGNORE INTO raw(note_id, target, fetched_at, http_status,
+                                                 content_type, body, body_hash, body_length,
+                                                 truncated)
+                       VALUES (?, ?, ?, NULL, 'text/html', ?, ?, ?, ?)""",
+                    (note_id, target, stamp, html[:RAW_CAP],
+                     hashlib.sha256(html).hexdigest(), len(html), int(len(html) > RAW_CAP)),
+                )
+            # Nothing to fetch: the content is already here.
+            self.db.execute(
+                "DELETE FROM fetch_queue WHERE note_id = ? AND target = ?", (note_id, target)
+            )
+            self._clear_machine_reading(note_id, target)
+        return self.store_extraction(
+            note_id, target, extraction, status="thin" if thin else "ok"
+        )
+
     def paste(self, note_id: str, target: str, text: str, title: str | None = None) -> bool:
         """Record human-supplied content for a capture (§10.2).
 
@@ -504,12 +594,7 @@ class SnapshotStore:
                    VALUES (?, ?, ?, 'ok')""",
                 (note_id, target, now()),
             )
-            self.db.execute(
-                """UPDATE snapshot SET extraction = NULL
-                   WHERE note_id = ? AND target = ?
-                     AND (extraction IS NULL OR extraction NOT LIKE ?)""",
-                (note_id, target, MANUAL + "%"),
-            )
+            self._clear_machine_reading(note_id, target)
         return self.store_extraction(note_id, target, extraction, status="ok")
 
     # ------------------------------------------------------------ reading
