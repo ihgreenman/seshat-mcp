@@ -296,6 +296,27 @@ class Checker:
                 {"target": row["target"]},
             ))
 
+        unmet = self.snapshots.execute(
+            """SELECT note_id, target, expectation, expectation_source
+               FROM snapshot WHERE expectation IS NOT NULL AND text IS NOT NULL"""
+        ).fetchall()
+        for row in unmet:
+            from .extract import expectation_met
+
+            text = self.snapshots.execute(
+                "SELECT text FROM snapshot WHERE note_id = ? AND target = ?",
+                (row["note_id"], row["target"]),
+            ).fetchone()["text"]
+            if expectation_met(row["expectation"], text) is False:
+                findings.append(Finding(
+                    "expectation not met", "review",
+                    f"{row['target']} does not contain what the citation sought "
+                    f"({row['expectation']!r}, from {row['expectation_source']}) "
+                    f"-- a candidate, not a verdict",
+                    (row["note_id"],),
+                    {"target": row["target"], "expectation": row["expectation"]},
+                ))
+
         captured = {
             (r["note_id"], r["target"])
             for r in self.snapshots.execute("SELECT note_id, target FROM snapshot")

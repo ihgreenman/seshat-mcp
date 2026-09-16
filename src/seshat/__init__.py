@@ -4,9 +4,9 @@ Named for the Egyptian goddess of writing, measurement, and record-keeping.
 See docs/seshat-mcp-spec.md for the design and its rationale.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
-SPEC_VERSION = "1.2"
+SPEC_VERSION = "1.3"
 """The spec revision this build implements.
 
 Reported by `seshat info`. If docs/seshat-mcp-spec.md carries a higher version

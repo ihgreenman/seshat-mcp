@@ -56,7 +56,21 @@ the new one:
   1.0  the new note adds; the old is still entirely correct
   0.5  the old note was partly right
   0.0  full retraction; the old note was wrong
-`why` is optional free text explaining the score."""
+`why` is optional free text explaining the score.
+
+TWO THINGS ABOUT WRITING NOTES WELL:
+
+1. Use markdown links with real anchor text. `[texas population data](url)`
+   states what you wanted from that page, and seshat stores that alongside the
+   captured content so a paywall or a moved page can be spotted later. "here"
+   or "this article" carries no such information.
+
+2. Keep a capture and an analysis as SEPARATE notes. One note says what a
+   source contains; a second references the first by id and says what follows
+   from it. Merged, a later correction cannot say whether the page was misread
+   or the inference was wrong -- split, superseding the analysis leaves the
+   capture untouched, and "my reading changed, the data did not" stays
+   readable."""
 
 CONTEXT_DESCRIPTION = """\
 Search the note store. Returns descriptions only; bodies are paid for
@@ -100,7 +114,11 @@ seeing all of it -- and a hub note is exactly the case that overflows.
 `links` are references found in this note's text; `backlinks` are notes whose
 text points at this one, which is the direction you cannot discover by reading.
 `with_sources=True` adds the preserved content of those links -- verbose, so ask
-for it only when you need to check what a source actually said."""
+for it only when you need to check what a source actually said. Each source
+carries `expectation` (what the citation said it wanted) and
+`expectation_met` (whether the captured text contains it). A false
+`expectation_met` is a REVIEW CANDIDATE, not a verdict: a statistical table can
+contain none of the expected words and still be a perfect capture."""
 
 SUPERSEDES_DESCRIPTION = """\
 Record, after the fact, that one existing note supersedes another.
@@ -161,10 +179,10 @@ def capability_report(store: Store) -> dict[str, Any]:
         # §7 is periodic maintenance, not something needed mid-conversation.
         "checker": True,
         "snapshots": snapshots is not None,
-        # Capture is live; extraction is not. Bytes are held and hashed, so
-        # `thin` (§6.6) cannot yet be assessed and is always 0 -- reporting
-        # that separately keeps `snapshots: true` from overstating the case.
-        "snapshot_extraction": False,
+        # §3.6: `thin: 0` is a false zero without extraction, indistinguishable
+        # from "no thin captures". The capability and the histogram's
+        # `unextracted` count answer different questions and both are needed.
+        "extraction": True,
         "embedding_model": store.embedder.model if store.embedder else None,
         "embedding_backlog": store.embedding_backlog(),
         "snapshot_status": (

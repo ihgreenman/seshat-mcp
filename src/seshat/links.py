@@ -122,3 +122,20 @@ def extract(text: str, exclude: str | None = None) -> list[Link]:
             add("note", note_id)
 
     return found
+
+
+_SENTENCE = re.compile(r"(?<=[.!?])\s+")
+
+
+def sentence_containing(text: str, target: str) -> str | None:
+    """The sentence a link sits in, for §6.9's expectation fallback.
+
+    Used only when the anchor text is missing or degenerate, so the cost of a
+    crude sentence splitter is a slightly long expectation string rather than a
+    wrong one.
+    """
+    for chunk in _SENTENCE.split(text.replace("\n", " ")):
+        if target in chunk:
+            cleaned = " ".join(chunk.split())
+            return cleaned or None
+    return None

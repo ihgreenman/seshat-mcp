@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
-from . import embeddings, ids, links, vectors
+from . import embeddings, extract as extract_mod, ids, links, vectors
 from .embeddings import DEFAULT_DIM
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -46,11 +46,24 @@ graceful degradation into an unusable one."""
 DEFAULT_LIMIT = 20
 DEFAULT_EDGE_LIMIT = 10
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """On-disk schema version -- `store_version` in §11.1, independent of both the
-spec version and the software version."""
+spec version and the software version.
+
+Version 4 consolidates 1..3 into one CREATE. Spec 1.3 needed a column on a
+table that was not yet populated anywhere, so a one-time reset was authorised
+in place of a migration chain -- the cheapest such break the design will get.
+There is deliberately no path from an older store: opening one is refused with
+instructions rather than silently upgraded or silently destroyed.
+"""
 
 SCHEMA = """
+-- Store identity. Written at creation, bumped only on migration. §11.2
+CREATE TABLE meta (
+  key    TEXT PRIMARY KEY,
+  value  TEXT NOT NULL
+);
+
 CREATE TABLE note (
   id          TEXT PRIMARY KEY,   -- four BIP-39 words, hyphenated. §6.1
   desc        TEXT NOT NULL,
@@ -99,6 +112,29 @@ CREATE TRIGGER assessment_ai AFTER INSERT ON assessment WHEN new.rationale IS NO
   INSERT INTO assessment_fts(rowid, rationale) VALUES (new.rowid, new.rationale);
 END;
 
+-- Derived index over note text. Rebuildable, disposable. §6.5
+-- Shares a key with `snapshot`, which is neither -- see snapshots.py.
+CREATE TABLE link (
+  note_id  TEXT NOT NULL REFERENCES note(id),
+  kind     TEXT NOT NULL,         -- 'url' | 'hash' | 'note'
+  target   TEXT NOT NULL,
+  label    TEXT,                  -- markdown anchor text; §6.9's expectation
+  PRIMARY KEY (note_id, kind, target)
+);
+CREATE INDEX link_target ON link(target);   -- backlinks and DISTINCT target
+
+-- Embedding provenance. A row's absence, or model != current, means
+-- "needs embedding". Model migration is a DELETE plus a worker drain. §6.3
+-- `note_vec` is NOT created here: a vec0 table in the schema would make the
+-- store unopenable without the extension. See vectors.ensure_table.
+CREATE TABLE embedding_meta (
+  note_id     TEXT PRIMARY KEY REFERENCES note(id),
+  model       TEXT NOT NULL,
+  dim         INTEGER NOT NULL,
+  normalized  INTEGER NOT NULL,
+  embedded_at TEXT NOT NULL
+);
+
 -- Lookups that missed. §6.1
 CREATE TABLE near_miss (
   requested    TEXT NOT NULL,
@@ -110,44 +146,9 @@ CREATE TABLE near_miss (
 );
 """
 
-MIGRATION_2 = """
--- Store identity. Written at creation, bumped only on migration. §11.2
-CREATE TABLE meta (
-  key    TEXT PRIMARY KEY,
-  value  TEXT NOT NULL
-);
 
--- Derived index over note text. Rebuildable, disposable. §6.5
--- Shares a key with `snapshot`, which is neither -- see snapshots.py.
-CREATE TABLE link (
-  note_id  TEXT NOT NULL REFERENCES note(id),
-  kind     TEXT NOT NULL,         -- 'url' | 'hash' | 'note'
-  target   TEXT NOT NULL,
-  label    TEXT,                  -- markdown anchor text, if any
-  PRIMARY KEY (note_id, kind, target)
-);
-CREATE INDEX link_target ON link(target);   -- backlinks and DISTINCT target
-"""
-
-MIGRATION_3 = """
--- Embedding provenance. A row's absence, or model != current, means
--- "needs embedding". Model migration is a DELETE plus a worker drain. §6.3
--- `note_vec` itself is NOT created here: a vec0 table in the schema would make
--- the store unopenable without the extension, turning an optional dependency
--- into a required one. See vectors.ensure_table.
-CREATE TABLE embedding_meta (
-  note_id     TEXT PRIMARY KEY REFERENCES note(id),
-  model       TEXT NOT NULL,
-  dim         INTEGER NOT NULL,
-  normalized  INTEGER NOT NULL,
-  embedded_at TEXT NOT NULL
-);
-"""
-
-MIGRATIONS: dict[int, str] = {2: MIGRATION_2, 3: MIGRATION_3}
-"""Applied in order to reach SCHEMA_VERSION. A fresh store runs SCHEMA and then
-every migration, so a migrated store and a fresh one are byte-identical in
-structure -- which `tests/test_migration.py` checks rather than assumes."""
+class StoreVersionError(Exception):
+    """The database on disk is not a schema this build can open."""
 
 
 class SeshatError(Exception):
@@ -189,13 +190,17 @@ class Hit:
     rank 1 score identically -- and the value is invariant across a 60x range
     of k (§6.8), which is what a number encoding almost nothing looks like.
     `vector_similarity` is the field that can actually be low.
+
+    On a recency listing all three are **null, never zero** (§3.2): no ranking
+    was fused and no query vector exists, so they are undefined rather than
+    low. Zero would read as "nothing matched" when nothing was asked.
     """
 
     id: str
     desc: str
-    score: float
+    score: float | None
     vector_similarity: float | None = None
-    matched: tuple[str, ...] = ()
+    matched: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -322,6 +327,10 @@ class Store:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # Version first, before any PRAGMA that writes. Setting journal_mode on
+        # a store that is about to be refused modifies the file -- a refusal
+        # that edits the thing it refused is not a refusal.
+        self._check_version()
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
@@ -351,33 +360,44 @@ class Store:
     def close(self) -> None:
         self.db.close()
 
-    def _ensure_schema(self) -> None:
-        """Create or migrate. `PRAGMA user_version` is authoritative; `meta`
-        mirrors it for §3.6's reporting contract."""
+    def _check_version(self) -> None:
+        """Refuse an unopenable store before touching a single byte of it."""
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        fresh = version == 0
-        if version > SCHEMA_VERSION:
-            raise SeshatError(
-                f"store {self.path} is schema version {version}, newer than this "
-                f"build's {SCHEMA_VERSION}. Upgrade seshat rather than downgrading the store."
+        if version in (0, SCHEMA_VERSION):
+            return
+        older = version < SCHEMA_VERSION
+        raise StoreVersionError(
+            f"{self.path} is schema version {version}, "
+            f"{'older' if older else 'newer'} than this build's {SCHEMA_VERSION}.\n"
+            + (
+                "Schema 4 consolidated versions 1-3 and there is no migration path: "
+                "spec 1.3 needed a column on a table nothing had populated, and a "
+                "one-time reset was taken instead of a migration chain.\n"
+                "Run `seshat reset` to archive this store and start a new one, or "
+                "point --db at a different file."
+                if older
+                else "Upgrade seshat rather than downgrading the store."
             )
+        )
 
+    def _ensure_schema(self) -> None:
+        """Create the schema, or refuse a database this build cannot open.
+
+        There is no migration path into version 4. Spec 1.3 required a column on
+        a table nothing had populated yet, so a one-time reset was authorised
+        instead of a migration chain. An older store is therefore refused with
+        instructions -- never upgraded on a guess, and never deleted on the
+        store's own initiative, because the only thing worse than an unopenable
+        note store is one that opens empty.
+        """
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
         with self.db:
-            if fresh:
+            if version == 0:
                 self.db.executescript(SCHEMA)
-                version = 1
-            for target in range(version + 1, SCHEMA_VERSION + 1):
-                self.db.executescript(MIGRATIONS[target])
-                self._on_migrated(target, fresh)
-            self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            self._write_meta(fresh)
-
-    def _on_migrated(self, target: int, fresh: bool) -> None:
-        """Data work a migration needs beyond its DDL."""
-        if target == 2 and not fresh:
-            # `link` is derived, so an existing store gets its index built the
-            # same way a rebuild would -- by re-reading note text (§6.5).
-            self._rebuild_links()
+                self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self._write_meta(fresh=True)
+            else:
+                self._write_meta(fresh=False)
 
     def _write_meta(self, fresh: bool) -> None:
         from . import SPEC_VERSION
@@ -500,22 +520,36 @@ class Store:
                 )
         # Committed first, queued after: the note is safe before any capture is
         # attempted, and a snapshot failure can never fail a write (§6.3).
-        self._queue_captures(note_id, captured)
+        self._queue_captures(note_id, captured, desc, text)
         if self._on_note_written:
             self._on_note_written()
         return note_id, [r for r, _, _ in edges]
 
-    def _queue_captures(self, note_id: str, found: Iterable[Any]) -> None:
-        """Enqueue URL captures. Swallows everything -- priority 1 (§1).
+    def _queue_captures(
+        self, note_id: str, found: Iterable[Any], desc: str = "", text: str = ""
+    ) -> None:
+        """Enqueue URL captures with their expectations. Swallows everything (§1).
 
         Capture-at-creation is the whole preservation model (§6.6), but a
         stalled or broken snapshot store must degrade to "no witness", never to
         "the note was not written".
+
+        The expectation (§6.9) is derived here, at write time, and copied into
+        the snapshot rather than read back from `link` -- `link` is derived and
+        re-extractable, so a later revision could otherwise leave a 2024 capture
+        being judged against 2026 intent.
         """
         if self.snapshots is None:
             return
         try:
-            targets = [link.target for link in found if link.kind == "url"]
+            targets = []
+            for link in found:
+                if link.kind != "url":
+                    continue
+                expectation, source = extract_mod.choose_expectation(
+                    link.label, desc, links.sentence_containing(text, link.target)
+                )
+                targets.append((link.target, expectation, source))
             if targets and self.snapshots.enqueue(note_id, targets) and self._on_captures_queued:
                 self._on_captures_queued()
         except Exception:
@@ -822,9 +856,7 @@ class Store:
         if query is None:
             # Empty or unusable query: recency listing. There is nothing for
             # either retriever to match on, so no fusion happens.
-            ordered = self._recent(since, limit)
-            scores = {note_id: _rrf(i) for i, note_id in enumerate(ordered, 1)}
-            return self._hydrate(scores, limit, {"recency": ordered}, None)
+            return self._recency_listing(since, limit)
 
         keyword = self._fts_ranking(query, since, limit)
         contributors: dict[str, list[str]] = {"fts": keyword}
@@ -836,6 +868,19 @@ class Store:
             contributors["vector"] = ids_
             rankings.append(ids_)
         return self._hydrate(fuse(rankings), limit, contributors, query_vector)
+
+    def _recency_listing(self, since: str | None, limit: int) -> list[Hit]:
+        """§3.2: ordered by recency, with every retrieval field null."""
+        ordered = self._recent(since, limit)
+        if not ordered:
+            return []
+        descs = dict(
+            self.db.execute(
+                f"SELECT id, desc FROM note WHERE id IN ({','.join('?' * len(ordered))})",
+                ordered,
+            ).fetchall()
+        )
+        return [Hit(note_id, descs[note_id], None, None, None) for note_id in ordered]
 
     def _hydrate(
         self,

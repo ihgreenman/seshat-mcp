@@ -3,17 +3,26 @@
 A persistent note store an LLM assistant can query and write cheaply.
 Design and rationale: [`docs/seshat-mcp-spec.md`](docs/seshat-mcp-spec.md).
 
-**Built against spec version 1.2.** The version is declared in the spec header
+**Built against spec version 1.3.** The version is declared in the spec header
 and recorded as `seshat.SPEC_VERSION`; `help` and `seshat info` report it
 alongside the software and store versions, which move independently (§11.1).
 `tests/test_spec_version.py` fails if the code ever claims a revision the
 document has not reached.
 
-**Status.** The full 1.1 tool surface is implemented, and retrieval is hybrid:
-FTS5/BM25 and vector KNN fused with RRF. Snapshot capture stores raw bytes
-without extraction. Remaining gaps are reported by `help` rather than hidden —
-`snapshot_extraction: false`, and `vector: false` whenever the vector side is
-not actually available. See [Not yet built](#not-yet-built).
+**Status.** The full tool surface is implemented, retrieval is hybrid
+(FTS5/BM25 and vector KNN fused with RRF), and snapshots capture, extract and
+record what was expected of them. `help` reports what is actually live rather
+than what is nominally supported — `vector: false` whenever the vector side is
+unavailable, and an `unextracted` count so `thin: 0` cannot read as a clean
+bill of health. See [Not yet built](#not-yet-built).
+
+**Schema 4 has no migration path.** It consolidates versions 1–3: spec 1.3
+needed a column on a table nothing had populated yet, and a one-time reset was
+taken instead of a migration chain. An older store is refused with instructions
+and left byte-for-byte untouched; `seshat reset` archives it (renames, never
+deletes) so the next run creates a fresh one. **This was the last free schema
+change** — once captures exist, every column is a real migration against
+witnesses that cannot be regenerated.
 
 ## Install
 
@@ -73,6 +82,10 @@ seshat fetch                # drain the capture queue now
 seshat reindex-links        # rebuild the derived link index (§6.5)
 seshat embed                # embed everything outstanding, now
 seshat reembed              # discard and rebuild all embeddings (model migration)
+seshat extract              # read captured bytes into text (§6.6)
+seshat reextract            # re-run extraction over stored bytes
+seshat paste <id> <url>     # supply content for a failed capture (§10.2)
+seshat reset                # archive an unopenable store and start fresh
 seshat check                # consistency report for human review (§7)
 ```
 
@@ -93,10 +106,35 @@ off is unrecoverable later — but `--no-snapshots` or `SESHAT_SNAPSHOTS=0` turn
 it off entirely, and the write path never touches the network itself (a test
 pins that).
 
-This build **captures but does not extract**: it stores the raw response bytes
-and a SHA-256 over the complete body, and leaves `text`, `title` and `full_hash`
-null. That ordering is deliberate — extraction is re-runnable over stored bytes,
-an unfetched page is not.
+Capture and extraction are separate stages and both run. Extraction happens
+immediately after capture, because **the deadline is on detection, not
+extraction**: bytes stay re-extractable forever, but a capture that turns out to
+be a paywall interstitial or a JS shell can only be repaired while the page is
+still live, and that cannot be known until something reads it.
+
+Extraction is stdlib-only — no lxml, no build toolchain. It records a version
+(`fetch:stdlib-html/1`), so adopting `trafilatura` later is `seshat reextract`
+over stored bytes rather than a migration. Non-text media (PDFs, images) is
+refused rather than decoded into mojibake that would look like a successful
+extraction, and surfaces as `thin` for a human to paste.
+
+**Each capture records what was expected of it** (§6.9). The markdown anchor
+text states the expectation in the act of citing —
+`[texas population data](url)` — and is copied into the snapshot, not read back
+from the derived `link` table, so a later re-extraction cannot leave an old
+capture judged against new intent. A degenerate label ("here", "this article")
+falls back to the note's own desc, and which of the two was used is recorded,
+because a miss means different things depending on it.
+
+The check is lexical and **never sets `status`**. A statistical table can
+contain none of the expected words and still be a perfect capture, so an unmet
+expectation is a review candidate — it appears in `seshat check` as a `review`
+row and in `read(with_sources=True)` as `expectation_met: false`.
+
+Provenance is three-valued: `fetch` for the worker, `manual` for pasted content,
+`browser` for a future extension. `seshat paste` supplies content for a failed
+capture without seshat ever handling a credential — you are already
+authenticated and already looking at the page.
 
 > **The one genuinely dangerous line in this design.** `link` and `snapshot`
 > share a `(note_id, target)` primary key and have opposite recoverability:
@@ -151,7 +189,11 @@ Each result carries three values and they are not interchangeable (§3.2):
 |---|---|
 | `score` | fused rank value. **Sort key only.** A perfect match and a worthless one-token match both score ~0.016 at rank 1 |
 | `vector_similarity` | raw cosine, or null if unembedded / vector side down. The number that can actually be low |
-| `matched` | which retrievers contributed — `["fts"]`, `["vector"]`, both, or `["recency"]` |
+| `matched` | which retrievers contributed — `["fts"]`, `["vector"]`, or both |
+
+On an empty query all three are **null, never zero** (§3.2): no ranking was
+fused and no query vector exists, so they are undefined rather than low. Zero
+would read as "nothing matched" when nothing was asked.
 
 Measured against 20 queries the store cannot answer: `score` gives no signal at
 all (identical values appear in answerable and unanswerable sets), while
@@ -280,7 +322,7 @@ a coin flip.
 .venv/bin/python -m pytest
 ```
 
-198 tests, no network access — the embedder and the fetcher are both injected,
+232 tests, no network access — the embedder and the fetcher are both injected,
 and the server tests run the subprocess with `--no-snapshots --no-embeddings`
 so nothing in the suite reaches Ollama or the web. Expected values are derived independently of the
 implementation (`tests/reference.py` re-derives pool membership, latest-wins
@@ -293,10 +335,10 @@ prefixes, strip-vs-index, vector degradation, and sum-vs-max fusion.
 
 ## Not yet built
 
-- **Snapshot extraction** [§6.6] — the `thin` status cannot be assessed until
-  an extractor exists, and `help` reports `snapshot_extraction: false` rather
-  than letting `snapshots: true` imply it.
-- **The review interface** [§10] — increment 4.
+- **The review interface** [§10] — increment 5.
+- **The browser extension** [§10.2] — increment 6. Eliminates the capture
+  deadline entirely: the browser supplies content at write time, so the gap
+  between reading a page and fetching it is zero.
 - **Growth management** [§8] — unsolved in the spec, deliberately not guessed
   at here.
 

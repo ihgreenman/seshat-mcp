@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .checker import DEFAULT_SIMILARITY, SEVERITIES, Checker, format_report
@@ -49,6 +50,19 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("reindex-links", help="rebuild the derived link index (§6.5)")
     sub.add_parser("embed", help="embed every note that needs it, now")
     sub.add_parser("reembed", help="discard all embeddings and rebuild (model migration, §6.3)")
+    sub.add_parser("extract", help="read captured bytes into text (§6.6)")
+
+    rx = sub.add_parser("reextract", help="re-run extraction over stored bytes")
+    rx.add_argument("--extractor", default=None, help="only rows from this extractor")
+
+    ps = sub.add_parser("paste", help="supply content for a failed capture (§10.2)")
+    ps.add_argument("id", help="note the snapshot belongs to")
+    ps.add_argument("target", help="the URL")
+    ps.add_argument("--title", default=None)
+    ps.add_argument("--file", type=Path, default=None, help="read text from a file (default: stdin)")
+
+    rs = sub.add_parser("reset", help="archive an unopenable store and start fresh")
+    rs.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
     k = sub.add_parser("check", help="consistency report for human review (§7)")
     k.add_argument("--json", action="store_true", help="machine-readable findings")
@@ -82,9 +96,42 @@ def _parser() -> argparse.ArgumentParser:
     return p
 
 
+def _reset(path: Path, assume_yes: bool) -> int:
+    """Archive a store this build cannot open, and let the next run create a new one.
+
+    Renames rather than deletes. Schema 4 has no migration path (§11), but "no
+    path forward" is not a reason to destroy what is there -- an archived file
+    can still be read with sqlite3 by hand.
+    """
+    if not path.exists():
+        print(f"{path} does not exist; nothing to reset", file=sys.stderr)
+        return 1
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if not assume_yes:
+        print(f"This will move {path} aside as {path.name}.{stamp}.bak and start a new,")
+        print("empty store. Notes in the old file are NOT migrated.")
+        if input("Type 'reset' to continue: ").strip() != "reset":
+            print("cancelled", file=sys.stderr)
+            return 1
+    moved = []
+    for candidate in [path, *(path.parent.glob(path.name + "*.snapshots.db"))]:
+        for suffix in ("", "-wal", "-shm"):
+            source = Path(str(candidate) + suffix)
+            if source.exists():
+                destination = Path(f"{source}.{stamp}.bak")
+                source.rename(destination)
+                moved.append(destination.name)
+    print(f"archived: {', '.join(moved)}")
+    print("the next command against this path will create a fresh store")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     path = args.db or default_db_path()
+
+    if args.command == "reset":
+        return _reset(path, args.yes)
 
     if args.command == "serve":
         serve(path, theta=args.theta, snapshots=args.snapshots,
@@ -174,6 +221,36 @@ def main(argv: list[str] | None = None) -> int:
                 threshold = SEVERITIES.index(args.fail_on)
                 if any(SEVERITIES.index(f.severity) <= threshold for f in findings):
                     return 2
+        elif args.command == "extract":
+            if snaps is None:
+                print("snapshot capture is disabled (--no-snapshots)", file=sys.stderr)
+                return 1
+            done = snaps.drain_extraction()
+            print(f"extracted {done}; {snaps.extraction_backlog()} still holding unread bytes")
+            thin = snaps.histogram()["thin"]
+            if thin:
+                print(f"{thin} capture(s) look thin -- review them while the targets "
+                      f"may still be live (§6.6)", file=sys.stderr)
+        elif args.command == "reextract":
+            if snaps is None:
+                print("snapshot capture is disabled (--no-snapshots)", file=sys.stderr)
+                return 1
+            # Only machine extractions: pasted content cannot be regenerated.
+            cleared = snaps.reset_extraction(args.extractor)
+            print(f"cleared {cleared} extraction(s); re-extracted {snaps.drain_extraction()}")
+        elif args.command == "paste":
+            if snaps is None:
+                print("snapshot capture is disabled (--no-snapshots)", file=sys.stderr)
+                return 1
+            body = args.file.read_text() if args.file else sys.stdin.read()
+            resolved = store.resolve(args.id)
+            if snaps.paste(resolved.id, args.target, body, args.title):
+                print(f"recorded {len(body)} chars for {resolved.id} -> {args.target} "
+                      f"(extraction=manual)")
+            else:
+                print("that snapshot already holds content; snapshots are immutable (§10.3)",
+                      file=sys.stderr)
+                return 1
         elif args.command == "misses":
             rows = store.db.execute(
                 "SELECT * FROM near_miss ORDER BY hit_count DESC, first_seen LIMIT ?",

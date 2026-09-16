@@ -1,9 +1,8 @@
-"""Snapshot capture. Spec §6.6, §3.6.
+"""Snapshot capture. Spec §6.6, §6.9, §3.6.
 
-Increment-one form: raw bytes plus a hash, no extraction. The deadline is real
--- a note written before a fetcher exists has permanently unrecoverable links --
-so capture ships before extraction, and these tests are mostly about capture
-happening at all and never being lost.
+Capture and extraction are separate stages, and both now run: capture because
+an unfetched page may be gone forever, extraction because `thin` cannot be
+assessed without it and `thin` is the status with a deadline.
 
 No test here touches the network. The fetcher is injected.
 """
@@ -66,8 +65,8 @@ def test_capture_stores_bytes_and_a_hash_of_the_complete_body(linked):
     assert source["status"] == "ok"
     assert source["body_hash"] == hashlib.sha256(body).hexdigest()
     assert source["body_length"] == len(body)
-    assert source["extracted"] is False, "bytes held, nothing parsed yet"
-    assert source["extraction"] is None
+    assert source["extracted"] is True
+    assert source["provenance"] == "fetch", "§10.2 provenance is three-valued"
 
 
 def test_queue_is_drained_on_success(linked):
@@ -123,7 +122,7 @@ def test_snapshots_are_immutable_once_taken(linked):
     SnapshotWorker(linked.snapshots, fetcher=ok(b"original content")).run_once()
     first = linked.snapshots.sources_for(note_id)[0]
 
-    linked.snapshots.enqueue(note_id, ["https://example.com/a"])
+    linked.snapshots.enqueue(note_id, [("https://example.com/a", None, None)])
     SnapshotWorker(linked.snapshots, fetcher=ok(b"the page changed later")).run_once()
     second = linked.snapshots.sources_for(note_id)[0]
 
@@ -186,8 +185,8 @@ def test_histogram_counts_permanent_failures_not_just_backlog(linked):
     assert histogram["ok"] == 1
     assert histogram["gone"] == 1
     assert histogram["pending"] == 1
-    assert histogram["thin"] == 0, "no extractor exists yet, so nothing can be thin"
-    assert histogram["unextracted"] == 1, "bytes held but unparsed must not read as done"
+    assert histogram["thin"] == 0, "nothing captured here was thin"
+    assert histogram["unextracted"] == 0, "extraction runs with capture now"
 
 
 def test_queue_is_durable_across_a_restart(tmp_path):
@@ -278,3 +277,156 @@ def test_the_default_fetcher_is_never_invoked_by_a_write(tmp_path, monkeypatch):
     store.create_note("a claim", "https://example.com/a")
     store.close()
     snaps.close()
+
+
+# --------------------------------------------------- §6.9 capture expectation
+
+
+def test_anchor_text_becomes_the_expectation(linked):
+    """§6.9: the expectation is already available and costs no new write-path
+    argument -- `[texas population data](url)` states it in the act of citing."""
+    note_id, _ = linked.create_note(
+        "state demographics",
+        "see [texas population data](https://example.gov/tx) for the figures",
+    )
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<p>Texas population data: 30 million</p>")).run_once()
+
+    source = linked.snapshots.sources_for(note_id)[0]
+    assert source["expectation"] == "texas population data"
+    assert source["expectation_source"] == "anchor"
+    assert source["expectation_met"] is True
+
+
+def test_a_degenerate_label_falls_back_to_the_note(linked):
+    """'here' states no expectation, so the note's own desc is a better answer."""
+    note_id, _ = linked.create_note(
+        "Bilinear transform compresses the frequency axis",
+        "details [here](https://example.com/x)",
+    )
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<p>unrelated content</p>")).run_once()
+
+    source = linked.snapshots.sources_for(note_id)[0]
+    assert "Bilinear transform" in source["expectation"]
+    assert source["expectation_source"] in ("desc", "sentence")
+
+
+def test_a_paywall_fails_the_expectation_without_changing_status(linked):
+    """§6.9's callout: candidate generation for review, NEVER a verdict.
+    Automatic marking would produce false `thin` on the reference pages most
+    worth preserving."""
+    note_id, _ = linked.create_note(
+        "state demographics",
+        "see [texas population data](https://example.gov/tx) for the figures",
+    )
+    # Substantial prose, so §6.6's structural check is satisfied -- this is
+    # precisely the case §6.9 exists for: what size and status cannot catch.
+    wall = (b"<html><body><p>Subscribe to continue reading. Sign in to your account. "
+            b"Choose a plan that works for you. Accept cookies to proceed. "
+            b"Members enjoy unlimited access to our award winning journalism. "
+            b"Already a subscriber? Sign in. Cancel anytime, no commitment required.</p>"
+            b"</body></html>")
+    SnapshotWorker(linked.snapshots, fetcher=ok(wall)).run_once()
+
+    source = linked.snapshots.sources_for(note_id)[0]
+    assert source["status"] == "ok", "structurally fine -- size cannot catch this"
+    assert source["expectation_met"] is False, "but it is not what was asked for"
+
+
+def test_expectation_is_copied_not_referenced(linked):
+    """§6.9: `link` is derived and re-extractable, so a later revision could
+    otherwise leave an old capture judged against new intent."""
+    note_id, _ = linked.create_note(
+        "a finding", "see [original wording](https://example.com/x) for detail"
+    )
+    SnapshotWorker(linked.snapshots, fetcher=ok()).run_once()
+    linked.reindex_links()  # rebuild the derived index underneath it
+
+    assert linked.snapshots.sources_for(note_id)[0]["expectation"] == "original wording"
+
+
+def test_expectation_met_is_none_when_unanswerable(linked):
+    """None is not False: one means 'not checked', the other 'checked and failed'."""
+    from seshat.extract import expectation_met
+
+    assert expectation_met(None, "text") is None
+    assert expectation_met("something", None) is None
+    assert expectation_met("the and of", "text") is None, "no content words to check"
+
+
+def test_redirects_are_recorded(linked):
+    """A recycled shortener produces plausible text from somewhere other than
+    the cited URL -- §6.9's wrong-page case, undetectable without this."""
+    note_id, _ = linked.create_note("a claim", "https://example.com/short")
+    SnapshotWorker(
+        linked.snapshots,
+        fetcher=lambda t: Fetched(status="ok", http_status=200, content_type="text/html",
+                                  body=b"<p>somewhere else entirely</p>",
+                                  final_url="https://elsewhere.example/actual"),
+    ).run_once()
+
+    assert linked.snapshots.sources_for(note_id)[0]["final_url"] == "https://elsewhere.example/actual"
+
+
+# ------------------------------------------------------------- extraction
+
+
+def test_capture_extracts_immediately(linked):
+    """The deadline is on detection, not extraction (§3.6): a thin capture can
+    only be repaired while the page is live."""
+    note_id, _ = linked.create_note("a claim", "https://example.com/a")
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<html><title>T</title><p>Real prose.</p></html>")).run_once()
+
+    source = linked.snapshots.sources_for(note_id)[0]
+    assert source["title"] == "T"
+    assert source["text"] == "Real prose."
+    assert source["extraction"].startswith("fetch:")
+    assert linked.snapshots.extraction_backlog() == 0
+
+
+def test_a_thin_capture_is_flagged_at_extraction(linked):
+    shell = b"<html><head><title>App</title></head><body><script>" + b"x" * 5000 + b"</script></body></html>"
+    note_id, _ = linked.create_note("a claim", "https://example.com/spa")
+    SnapshotWorker(linked.snapshots, fetcher=ok(shell)).run_once()
+
+    assert linked.snapshots.sources_for(note_id)[0]["status"] == "thin"
+    assert linked.snapshots.histogram()["thin"] == 1
+
+
+def test_reextraction_never_overwrites_pasted_content(linked):
+    """§10.3: a snapshot with no content is being filled, not rewritten. Pasted
+    text is a witness nothing can regenerate."""
+    note_id, _ = linked.create_note("a claim", "https://example.com/paywalled")
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<html>" + b"<script>x</script>" * 500 + b"</html>")).run_once()
+    assert linked.snapshots.sources_for(note_id)[0]["status"] == "thin"
+
+    assert linked.snapshots.paste(note_id, "https://example.com/paywalled", "The real article text.")
+    source = linked.snapshots.sources_for(note_id)[0]
+    assert source["text"] == "The real article text."
+    assert source["provenance"] == "manual"
+    assert source["status"] == "ok"
+
+    linked.snapshots.reset_extraction()
+    assert linked.snapshots.drain_extraction() >= 0
+    after = linked.snapshots.sources_for(note_id)[0]
+    assert after["text"] == "The real article text.", "manual witness survives a re-extraction"
+    assert after["provenance"] == "manual"
+
+
+def test_reextraction_refreshes_machine_extractions(linked):
+    note_id, _ = linked.create_note("a claim", "https://example.com/a")
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<p>Original prose.</p>")).run_once()
+
+    assert linked.snapshots.reset_extraction() == 1
+    assert linked.snapshots.extraction_backlog() == 1
+    assert linked.snapshots.drain_extraction() == 1
+    assert linked.snapshots.sources_for(note_id)[0]["text"] == "Original prose."
+
+
+def test_pasting_does_not_rewrite_a_good_capture(linked):
+    """A snapshot that already holds content is immutable like the note it
+    witnesses (§10.3)."""
+    note_id, _ = linked.create_note("a claim", "https://example.com/a")
+    SnapshotWorker(linked.snapshots, fetcher=ok(b"<p>The captured text.</p>")).run_once()
+
+    assert linked.snapshots.paste(note_id, "https://example.com/a", "different text") is False
+    assert linked.snapshots.sources_for(note_id)[0]["text"] == "The captured text."

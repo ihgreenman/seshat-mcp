@@ -28,9 +28,13 @@ EXTRACTOR = "stdlib-html/1"
 """Name and version recorded in `snapshot.extraction`. Bump when output changes,
 so a re-run is distinguishable from an original capture."""
 
+FETCH_PREFIX = "fetch:"
+BROWSER_PREFIX = "browser:"
 MANUAL = "manual"
-"""§10.2: pasted content is a witness too, but a human-mediated one, and the
-distinction must survive in the data rather than becoming invisible."""
+"""§10.2 provenance, three-valued: `fetch` for the worker, `browser` for
+extension captures, `manual` for pasted text. Pasted content is a witness too,
+but a human-mediated one, and the distinction must survive in the data rather
+than becoming invisible."""
 
 TEXT_CAP = 64 * 1024
 """§6.6: 'a 64k cap covers articles comfortably'. `full_hash` is computed over
@@ -231,3 +235,76 @@ def is_thin(extracted_length: int, raw_length: int, unsupported: bool = False) -
     if unsupported:
         return True
     return extracted_length < THIN_CHARS and raw_length >= THIN_RAW_FLOOR
+
+
+# --------------------------------------------------------- §6.9 expectation
+
+EXPECTATION_COVERAGE = 0.5
+"""Fraction of an expectation's content words that must appear in the
+extraction for it to count as met. A guess, like every threshold in this design
+that has not been measured -- and one that only feeds a review queue, so being
+wrong costs a reviewer's glance rather than a corrupted record."""
+
+
+def expectation_terms(expectation: str | None) -> list[str]:
+    """Content words of an expectation, function words removed.
+
+    Anchor text is short, so a single shared stopword would otherwise be a
+    large fraction of the match -- the same failure §6.8 records for query
+    expansion, in a different place.
+    """
+    from .store import STOPWORDS
+
+    if not expectation:
+        return []
+    words = re.findall(r"[A-Za-z0-9_]+", expectation.lower())
+    return [w for w in words if w not in STOPWORDS and len(w) > 1]
+
+
+def expectation_met(expectation: str | None, text: str | None) -> bool | None:
+    """Does the extraction contain what the citation said it would? (§6.9)
+
+    Lexical, deliberately: embedding a whole page and comparing it to a short
+    label is the mean-pooling blur that made chunking necessary for documents,
+    and those cosines need corpus calibration besides.
+
+    Returns None when the question cannot be asked -- no expectation recorded,
+    nothing extracted yet, or an expectation made entirely of function words.
+    None is not False, and the difference matters: one is "not checked", the
+    other is "checked and failed".
+
+    **Never a verdict.** A statistical table may contain none of the expected
+    words in prose while being a perfect capture. Like §7.2's suggested links
+    this is candidate generation for review, and it must never set `status`.
+    """
+    terms = expectation_terms(expectation)
+    if not terms or not text:
+        return None
+    haystack = text.lower()
+    found = sum(1 for term in terms if term in haystack)
+    return (found / len(terms)) >= EXPECTATION_COVERAGE
+
+
+def choose_expectation(
+    label: str | None, desc: str, sentence: str | None = None
+) -> tuple[str | None, str | None]:
+    """What was sought at this link, and how that was decided (§6.9).
+
+    The markdown anchor text states the expectation in the act of citing, and
+    costs no new write-path argument. Where the label is missing or degenerate
+    ("here", "this article"), the note's own desc is a better answer, optionally
+    with the sentence the link sat in.
+
+    The source is returned and stored because a failed check means different
+    things depending on it: against a real anchor label the author said what
+    they wanted and did not get it, while against a desc fallback the
+    expectation was inferred and a miss may say nothing at all.
+    """
+    from .snapshots import DEGENERATE_LABELS
+
+    cleaned = (label or "").strip()
+    if cleaned and cleaned.lower() not in DEGENERATE_LABELS:
+        return cleaned, "anchor"
+    if sentence and sentence.strip():
+        return f"{desc} -- {sentence.strip()}"[:500], "sentence"
+    return (desc or None), ("desc" if desc else None)

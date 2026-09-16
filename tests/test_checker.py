@@ -384,3 +384,42 @@ def test_suggested_links_finds_similar_notes_with_no_path_between_them(tmp_path)
     assert frozenset({twin_a, twin_b}) in pairs, "identical notes with no edge are a candidate"
     assert frozenset({linked_a, linked_b}) not in pairs, "an existing path is not a candidate"
     assert all(f.severity == "info" for f in found), "candidates are not defects"
+
+
+def test_an_unmet_expectation_is_a_review_candidate_not_an_error(paths):
+    """§6.9: like §7.2's suggested links, candidate generation for review. A
+    statistical table may contain none of the expected words in prose while
+    being a perfect capture, so this can never be a verdict."""
+    notes, snap_path = paths
+    snaps = SnapshotStore(snap_path)
+    store = Store(notes, snapshots=snaps)
+    store.create_note("state demographics",
+                      "see [texas population data](https://example.gov/tx) for figures")
+    SnapshotWorker(snaps, fetcher=lambda t: Fetched(
+        status="ok", http_status=200, content_type="text/html",
+        body=b"<p>Subscribe to continue reading. Sign in to your account today. "
+             b"Members get unlimited access to everything we publish, cancel anytime.</p>",
+    )).run_once()
+    store.close()
+    snaps.close()
+
+    found = [f for f in check(paths) if f.check == "expectation not met"]
+    assert len(found) == 1
+    assert found[0].severity == "review", "never an error"
+    assert "candidate, not a verdict" in found[0].message
+
+
+def test_a_met_expectation_is_not_flagged(paths):
+    notes, snap_path = paths
+    snaps = SnapshotStore(snap_path)
+    store = Store(notes, snapshots=snaps)
+    store.create_note("state demographics",
+                      "see [texas population data](https://example.gov/tx) for figures")
+    SnapshotWorker(snaps, fetcher=lambda t: Fetched(
+        status="ok", http_status=200, content_type="text/html",
+        body=b"<p>Texas population data for the last decade, by county.</p>",
+    )).run_once()
+    store.close()
+    snaps.close()
+
+    assert [f for f in check(paths) if f.check == "expectation not met"] == []

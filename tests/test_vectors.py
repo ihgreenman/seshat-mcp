@@ -422,7 +422,13 @@ def test_matched_reports_which_retrievers_contributed(vstore, embedder):
     assert vstore.context("alpha beta")[0].matched == ("fts",)
 
 
-def test_recency_listing_is_labelled_as_such(vstore):
+def test_recency_listing_reports_null_not_zero(vstore):
+    """§3.2: on an empty query all three are null. No ranking was fused and no
+    query vector exists, so they are undefined rather than low -- zero would
+    read as "nothing matched" when nothing was asked."""
     vstore.create_note("a note", "body")
+    EmbeddingWorker(vstore).drain()
     hit = vstore.context("")[0]
-    assert hit.matched == ("recency",), "no retriever ran; say so rather than implying one did"
+    assert hit.score is None
+    assert hit.vector_similarity is None
+    assert hit.matched is None
