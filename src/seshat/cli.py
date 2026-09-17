@@ -189,8 +189,12 @@ def main(argv: list[str] | None = None) -> int:
                       f"not identifiers -- try `seshat read`", file=sys.stderr)
             hits = store.context(args.query, args.since, args.limit)
             for h in hits:
+                # All three are null on a recency listing (§3.2) -- undefined
+                # rather than low, so they print as absent rather than as zero.
+                score = f"{h.score:.5f}" if h.score is not None else "   --  "
                 sim = f"{h.vector_similarity:+.3f}" if h.vector_similarity is not None else "  --  "
-                print(f"{h.score:.5f}  cos {sim}  {','.join(h.matched):<11}  {h.id}  {h.desc}")
+                matched = ",".join(h.matched) if h.matched else "recency"
+                print(f"{score}  cos {sim}  {matched:<11}  {h.id}  {h.desc}")
         elif args.command == "read":
             from dataclasses import asdict
             print(json.dumps(asdict(store.read(args.id)), indent=2))

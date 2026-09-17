@@ -178,3 +178,20 @@ def test_context_cannot_find_a_note_by_its_own_id(store, mk):
 
     citing = store.create_note("confirmed on hardware", f"reproduced what {note_id} describes")[0]
     assert [h.id for h in store.context(note_id)] == [citing], "citations are findable"
+
+
+def test_the_cli_renders_a_recency_listing(store, capsys, tmp_path):
+    """§3.2 made score/similarity/matched null on an empty query, and the CLI
+    formatter assumed numbers. Found on the first real use of the store, which
+    is exactly the path no unit test had exercised."""
+    from seshat.cli import main
+
+    path = tmp_path / "cli.db"
+    s = Store(path)
+    s.create_note("a finding", "body")
+    s.close()
+
+    assert main(["--db", str(path), "--no-snapshots", "--no-embeddings", "context"]) == 0
+    out = capsys.readouterr().out
+    assert "a finding" in out
+    assert "recency" in out, "say which retriever ran, and none did"
