@@ -583,3 +583,59 @@ def test_a_repair_leaves_the_fetchers_bytes_as_captured(server):
         "SELECT body_hash FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
     ).fetchone()["body_hash"]
     assert after == before
+
+
+# ------------------------------------------------- the vector side is wired
+
+
+def test_the_ui_searches_with_the_vector_side_when_one_is_configured(tmp_path):
+    """Found by asking "is this actually wired to Ollama?" -- it was not.
+
+    Both of the interface's stores were constructed without an embedder, so
+    search here was silently keyword-only: a quietly worse answer rather than a
+    visible failure, which is the exact thing §3.6's capability reporting exists
+    to prevent.
+    """
+    import sys
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from test_vectors import FakeEmbedder
+    from seshat.worker import EmbeddingWorker
+
+    notes = tmp_path / "n.db"
+    embedder = FakeEmbedder()
+    store = Store(notes, embedder=embedder)
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec unavailable")
+    store.create_note("Nyquist precision loss", "prewarping fixes it")
+    EmbeddingWorker(store).drain()
+    store.close()
+
+    review = Review(notes, snapshots=False, capture_api=True, embedder=embedder)
+    try:
+        assert review.store.embedder is not None
+        assert review.writer.embedder is not None, "captures must be embeddable too"
+        hits = review.store.context("nyquist")
+        assert any(h.matched and "vector" in h.matched for h in hits)
+    finally:
+        review.close()
+
+
+def test_the_ui_says_so_when_it_has_only_keyword_results(tmp_path):
+    """Degradation must be visible, not silently worse."""
+    notes = tmp_path / "n.db"
+    store = Store(notes)
+    store.create_note("Nyquist precision loss", "prewarping fixes it")
+    store.close()
+
+    review = Review(notes, snapshots=False, capture_api=False, embedder=None)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), type("B", (Handler,), {"review": review}))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        _, body = get(base, "/search?q=nyquist")
+        assert "Keyword results only" in body
+        assert "worse than usual" in body
+    finally:
+        httpd.shutdown()
+        review.close()

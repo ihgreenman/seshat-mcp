@@ -121,6 +121,12 @@ Three things are enforced rather than intended:
   the separate snapshot file.
 - **127.0.0.1 only.** Binding anything else raises; remote transport is out of
   scope (§12) and would demand an auth model this tool has no business owning.
+- **It uses the same retrieval path as everything else.** The interface builds
+  its stores with the configured embedder, so search here is hybrid rather than
+  keyword-only — and when the vector side cannot answer, the search page says
+  so rather than quietly returning worse results. The process also runs its own
+  embedding worker, because an extension capture writes a note *here*, not in
+  the MCP server, and would otherwise sit unembedded until something else ran.
 - **POSTs are origin-checked and token-guarded.** "localhost is safe" stops
   being true the moment a browser is a client — any page you visit can post to
   127.0.0.1. §10.2 names this for the extension; it applies the instant a

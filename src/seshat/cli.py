@@ -142,7 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         from .review import serve_review
 
         serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots,
-                     capture_api=args.capture_api)
+                     capture_api=args.capture_api, embeddings=args.embeddings,
+                     model=args.model)
         return 0
 
     if args.command == "token":

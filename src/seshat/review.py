@@ -37,8 +37,10 @@ from pathlib import Path
 
 from . import SPEC_VERSION, __version__
 from .checker import Checker, reading_guide
+from .embeddings import DEFAULT_MODEL, OllamaEmbedder
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .store import Store
+from .worker import EmbeddingWorker
 
 log = logging.getLogger("seshat.review")
 
@@ -118,9 +120,18 @@ def load_token(db_path: Path) -> str:
 class Review:
     """Everything the handler needs, built once and shared across requests."""
 
-    def __init__(self, db_path: Path, snapshots: bool = True, capture_api: bool = True):
+    def __init__(
+        self,
+        db_path: Path,
+        snapshots: bool = True,
+        capture_api: bool = True,
+        embedder=None,
+    ):
         self.db_path = Path(db_path)
-        self.store = Store(self.db_path, read_only=True)
+        # The embedder is not optional for quality: without it this interface
+        # searches by keyword only, which is a quietly worse answer rather than
+        # a visible failure -- the exact thing §3.6 exists to prevent.
+        self.store = Store(self.db_path, read_only=True, embedder=embedder)
         self.snapshots = SnapshotStore(snapshot_path_for(self.db_path)) if snapshots else None
         # Regenerated per process: a form from a previous run is not a form.
         self.token = secrets.token_urlsafe(24)
@@ -133,7 +144,7 @@ class Review:
         # endpoint. No code path anywhere can update an existing note.
         self.writer: Store | None = None
         if capture_api:
-            self.writer = Store(self.db_path, snapshots=self.snapshots)
+            self.writer = Store(self.db_path, snapshots=self.snapshots, embedder=embedder)
 
     def close(self) -> None:
         self.store.close()
@@ -437,6 +448,11 @@ consistency: §7.1 validates structure, not truth, and §7.2 only generates cand
 
 def render_search(review: Review, query: str) -> str:
     hits = review.store.context(query, limit=40)
+    degraded = ""
+    if hits and not any(h.matched and "vector" in h.matched for h in hits):
+        degraded = ('<div class="card warn">Keyword results only — the vector side '
+                    'did not answer. Either nothing is embedded yet, or the embedder '
+                    'is unavailable. These results are worse than usual, not better.</div>')
     rows = "".join(
         f'<div class="note">{note_link(h.id, h.desc)}'
         f'<div class="dim mono">'
@@ -449,7 +465,7 @@ def render_search(review: Review, query: str) -> str:
     if hits and all((h.vector_similarity or 0) < 0.6 for h in hits if h.vector_similarity):
         caveat = ('<div class="card warn">Every result is weakly matched. The store '
                   'may simply hold nothing on this.</div>')
-    return f"""<h1>Search</h1><p class="dim">{E(query)}</p>{caveat}
+    return f"""<h1>Search</h1><p class="dim">{E(query)}</p>{degraded}{caveat}
 {rows or '<p class=dim>No results.</p>'}"""
 
 
@@ -698,12 +714,27 @@ def serve_review(
     host: str = "127.0.0.1",
     snapshots: bool = True,
     capture_api: bool = True,
+    embeddings: bool = True,
+    model: str = DEFAULT_MODEL,
 ) -> None:
-    review = Review(db_path, snapshots=snapshots, capture_api=capture_api)
+    embedder = OllamaEmbedder(model=model) if embeddings else None
+    review = Review(
+        db_path, snapshots=snapshots, capture_api=capture_api, embedder=embedder
+    )
     if host not in ("127.0.0.1", "localhost", "::1"):
         # §10/§12: remote transport is out of scope, and binding wider would
         # demand an auth model this tool has no business owning.
         raise ValueError(f"refusing to bind {host}: the review interface is localhost-only")
+
+    # An extension capture writes a note here, not in the MCP server, so this
+    # process needs its own drain -- otherwise captures sit unembedded until
+    # something else happens to run.
+    worker = None
+    if embedder is not None and review.writer is not None and review.writer.vector_loaded:
+        worker = EmbeddingWorker(review.writer)
+        review.writer._on_note_written = worker.notify
+        worker.start()
+        log.info("embedder: %s (%d to embed)", model, review.writer.embedding_backlog())
 
     handler = type("BoundHandler", (Handler,), {"review": review})
     httpd = ThreadingHTTPServer((host, port), handler)
@@ -718,4 +749,6 @@ def serve_review(
         pass
     finally:
         httpd.shutdown()
+        if worker is not None:
+            worker.stop()
         review.close()
