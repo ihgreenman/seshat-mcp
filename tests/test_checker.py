@@ -423,3 +423,108 @@ def test_a_met_expectation_is_not_flagged(paths):
     snaps.close()
 
     assert [f for f in check(paths) if f.check == "expectation not met"] == []
+
+
+# --------------------------------------------- §7.2 similarity is a real cosine
+
+
+class _FixedEmbedder:
+    """Returns a chosen vector per note, so the expected cosine is known in
+    closed form before any code under test runs."""
+
+    model = "fixed"
+    dim = 4
+
+    def __init__(self, vectors):
+        self.vectors = vectors
+        self.seen = 0
+
+    def embed(self, texts, timeout=0):
+        out = []
+        for _ in texts:
+            out.append(self.vectors[min(self.seen, len(self.vectors) - 1)])
+            self.seen += 1
+        return out
+
+
+def _embedded_store(tmp_path, vectors):
+    from seshat.worker import EmbeddingWorker
+
+    path = tmp_path / "n.db"
+    store = Store(path, embedder=_FixedEmbedder(vectors))
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+    for index in range(len(vectors)):
+        store.create_note(f"note {index}", f"body of note {index}")
+    EmbeddingWorker(store).drain()
+    store.db.commit()
+    store.close()
+    return path
+
+
+def test_similarity_is_a_cosine_not_a_dot_product(tmp_path):
+    """Magnitude must not reach the score. Two parallel vectors of magnitude 2
+    have cosine 1.0; their dot product is 4.0, which is not a similarity and is
+    not comparable to `--similarity` at all.
+
+    The expected value is derived by hand from the definition, not from the
+    implementation: cos = 1 for parallel vectors, whatever their length.
+    """
+    path = _embedded_store(tmp_path, [[2.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]])
+    checker = Checker(str(path), similarity=0.5)
+    try:
+        findings = checker.check_suggested_links()
+    finally:
+        checker.close()
+    assert len(findings) == 1
+    assert findings[0].detail["similarity"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_similarity_agrees_with_sqlite_vec(tmp_path):
+    """Two independent paths to the same number: this checker's Python, and
+    `vec_distance_cosine` in sqlite-vec's C. What is asserted is the residual.
+
+    Independence is the point. Recomputing the dot product in the test the same
+    way the checker does would reproduce a missing normalisation in green.
+    """
+    import math
+
+    a = [1.0, 2.0, 3.0, 4.0]
+    b = [4.0, 1.0, 0.5, 2.0]
+    path = _embedded_store(tmp_path, [a, b])
+
+    checker = Checker(str(path), similarity=-1.0)
+    try:
+        findings = checker.check_suggested_links()
+        ours = findings[0].detail["similarity"]
+
+        from seshat import vectors as vectors_module
+
+        assert vectors_module.load_extension(checker.db)
+        theirs = checker.db.execute(
+            """SELECT vec_distance_cosine(
+                   (SELECT embedding FROM note_vec LIMIT 1),
+                   (SELECT embedding FROM note_vec LIMIT 1 OFFSET 1)) AS d"""
+        ).fetchone()["d"]
+    finally:
+        checker.close()
+
+    # And a third, closed-form: cos = a.b / (|a||b|), computed from the inputs
+    # rather than from anything either path stored.
+    dot = sum(x * y for x, y in zip(a, b))
+    by_hand = dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+    assert abs(ours - (1.0 - theirs)) < 1e-5, "checker disagrees with sqlite-vec"
+    assert abs(ours - by_hand) < 1e-5, "checker disagrees with the definition"
+
+
+def test_a_zero_vector_is_excluded_rather_than_divided_by(tmp_path):
+    """No direction, so no angle to anything. The alternative is a ZeroDivision
+    in a maintenance command, or treating it as orthogonal to everything, which
+    asserts something false."""
+    path = _embedded_store(tmp_path, [[0.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    checker = Checker(str(path), similarity=-1.0)
+    try:
+        assert checker.check_suggested_links() == []
+    finally:
+        checker.close()

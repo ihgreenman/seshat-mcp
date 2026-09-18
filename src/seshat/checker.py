@@ -30,7 +30,12 @@ only a human can make, which is most of what this checker produces."""
 DEFAULT_SIMILARITY = 0.90
 """Cosine threshold for suggested links (§7.2). Open question §9.5: no
 principled basis. Start high and tune down -- topical relatedness is not
-supersession, and most candidates will be rejected."""
+supersession, and most candidates will be rejected.
+
+Model-keyed, not universal: nomic-embed-text cosines occupy a compressed band,
+so a value tuned against one model does not transfer to another, and a re-embed
+under a different model invalidates whatever experience suggested it. It is at
+least a cosine -- `Checker._vectors` normalises so that it is."""
 
 NEAR_IDENTICAL = 0.98
 """Text similarity above which a `desc` change is classified as a description
@@ -340,6 +345,20 @@ class Checker:
     # ----------------------------------------------------- §7.2 semantic
 
     def _vectors(self) -> dict[str, list[float]]:
+        """Stored embeddings, L2-NORMALISED on the way out.
+
+        Normalising here is what makes the dot product in
+        `check_suggested_links` a cosine. Without it that sum is scaled by the
+        product of the two magnitudes, and `--similarity` is then a threshold
+        on a quantity with no fixed range -- 4.0 for a pair of identical
+        magnitude-2 vectors, where the cosine is 1.0.
+
+        Whether a backend returns unit vectors is not something to assume: the
+        store records a `normalized` flag per embedding precisely because it
+        varies, and every other similarity in seshat goes through
+        `vec_distance_cosine`, which normalises internally. Doing it here keeps
+        the two paths answering the same question.
+        """
         try:
             from . import vectors as module
 
@@ -350,12 +369,20 @@ class Checker:
             ).fetchall()
         except sqlite3.OperationalError:
             return {}
+        import math
         import struct
 
         out = {}
         for row in rows:
             blob = row["embedding"]
-            out[row["note_id"]] = list(struct.unpack(f"<{len(blob) // 4}f", blob))
+            vector = list(struct.unpack(f"<{len(blob) // 4}f", blob))
+            norm = math.sqrt(sum(x * x for x in vector))
+            if norm == 0.0:
+                # No direction, so no angle to anything. Excluded rather than
+                # divided by zero, and rather than compared as if it were at
+                # right angles to everything.
+                continue
+            out[row["note_id"]] = [x / norm for x in vector]
         return out
 
     def _reachable(self) -> dict[str, set[str]]:
@@ -398,6 +425,7 @@ class Checker:
             for b in ids[i + 1 :]:
                 if b in reach.get(a, ()) or a in reach.get(b, ()):
                     continue
+                # A cosine, because `_vectors` normalised both sides.
                 score = sum(x * y for x, y in zip(va, vectors[b]))
                 if score >= self.similarity:
                     findings.append(Finding(
