@@ -105,7 +105,7 @@ background fetch gets a paywall and your browser doesn't. See
 .venv/bin/python -m pytest
 ```
 
-268 tests, no network access: the embedder and the fetcher are both injected.
+277 tests, no network access: the embedder and the fetcher are both injected.
 Expected values are derived independently of the implementation
 (`tests/reference.py` re-derives the load-bearing rules from the spec text and
 imports nothing from `seshat`), and the assertions that matter have been checked

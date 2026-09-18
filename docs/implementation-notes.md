@@ -300,6 +300,37 @@ it. Worth stating plainly: this was found on a corpus of five notes, so the
 function word plus OR plus rank-blind fusion — and does not depend on corpus
 size.
 
+### A second defect found by running it: a silently dropped key
+
+Reported from real use by another assistant writing into the store. It passed
+`rationale` — the *column* name from §5.5's schema — where the argument is
+`why`. Because the `supersedes` entries were typed `dict[str, Any]`, the schema
+said `additionalProperties: true`, the key was accepted, and
+`edge.get("why")` simply never looked at it. The edge was written with a null
+rationale and the call reported success.
+
+That is a priority-1/2 failure rather than a missing feature: the caller was
+told its reasoning had been recorded and it had not been. It was caught only
+because that caller re-read its own work with `chain`, which is not a habit
+anything can rely on.
+
+The spec sets this trap itself — §5.5's parenthetical explains that the column
+is named `rationale` only to avoid colliding with the `note` table, so a reader
+of the schema has every reason to reach for that word.
+
+The fix is in the store rather than the tool, because the MCP surface is not
+the only caller: an unknown key in a `supersedes` entry is now an error naming
+the confusion ("`rationale` (did you mean `why`?)"), the required keys report
+themselves by name instead of raising a bare `KeyError`, and validation runs
+over the whole list before anything is resolved or written — a note carrying
+half its requested edges would be the same lie one table over. The tool schema
+declares `additionalProperties: false` to match, and a test compares the
+schema's property set against the store's constant so the two cannot drift.
+
+Generalising past the one key: the rule is that **ignoring an input is never a
+silent success**. Anywhere a caller-supplied structure is read field by field,
+the fields not read have to be an error.
+
 ### One spec claim this build could not verify
 
 §6 (through spec 1.1) said omitting nomic's `search_document:` / `search_query:` prefixes, or using

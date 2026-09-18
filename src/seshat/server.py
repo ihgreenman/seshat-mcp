@@ -230,7 +230,41 @@ def build_server(store: Store) -> MCPServer:
         text: Annotated[str, Field(description="The body of the note.")],
         supersedes: Annotated[
             list[dict[str, Any]] | None,
-            Field(description="[{id, retained, why?}] -- notes this one replaces or extends."),
+            Field(
+                description=(
+                    "[{id, retained, why?}] -- notes this one replaces or extends. "
+                    "The rationale argument is `why`; an unknown key is rejected, "
+                    "not ignored."
+                ),
+                # The store enforces this -- every caller goes through it, not
+                # just this tool -- and produces the message that names the
+                # mistake. The schema states the same rule so a client that
+                # validates rejects it a round-trip earlier; test_server pins
+                # the two together. The whole `anyOf` is replaced rather than a
+                # sibling `items` added, because pydantic's generated branch
+                # says additionalProperties true and leaving both in place
+                # would state one rule twice with two different answers.
+                json_schema_extra={
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "retained": {
+                                        "type": "number", "minimum": 0, "maximum": 1
+                                    },
+                                    "why": {"type": "string"},
+                                },
+                                "required": ["id", "retained"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        {"type": "null"},
+                    ]
+                },
+            ),
         ] = None,
     ) -> dict[str, Any]:
         note_id, resolutions = store.create_note(desc, text, supersedes or [])

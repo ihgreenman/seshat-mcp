@@ -149,3 +149,59 @@ def test_creation_edges_are_atomic_with_the_note(store, mk):
     with pytest.raises(SeshatError):
         store.create_note("b", "body", [{"id": a, "retained": 42.0}])
     assert store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0] == before
+
+
+def test_an_unknown_edge_key_is_refused_rather_than_ignored(store, mk):
+    """Reported from real use: `rationale` -- the *column* name in §5.5 -- was
+    passed where the argument is `why`, accepted, and dropped. The caller was
+    told the edge was written and believed the reasoning went with it.
+
+    Ignoring an unrecognised key is indistinguishable from honouring it at the
+    call site, which makes it a priority-2 failure: not a lost feature, a false
+    belief about what the store holds.
+    """
+    a = mk("a")
+    before = store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0]
+    with pytest.raises(SeshatError) as exc:
+        store.create_note("b", "body", [{"id": a, "retained": 0.5, "rationale": "why not"}])
+    assert "why" in str(exc.value), "say what the argument is actually called"
+    assert store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0] == before
+
+
+def test_a_missing_required_edge_key_names_itself(store, mk):
+    """Previously a bare KeyError, which `reported` does not translate -- the
+    caller saw a generic crash instead of the one word that was wrong."""
+    a = mk("a")
+    with pytest.raises(SeshatError) as exc:
+        store.create_note("b", "body", [{"id": a}])
+    assert "retained" in str(exc.value)
+    with pytest.raises(SeshatError):
+        store.create_note("b", "body", [{"retained": 0.5}])
+    with pytest.raises(SeshatError):
+        store.create_note("b", "body", ["not-a-dict"])
+
+
+def test_a_good_key_still_reaches_the_rationale_column(store, mk):
+    """The rejection must not be so eager that it breaks the working path: the
+    argument `why` lands in the column `rationale`, and that rename is the
+    whole source of the confusion."""
+    a = mk("a")
+    b, _ = store.create_note("b", "body", [{"id": a, "retained": 0.5, "why": "sign error"}])
+    stored = store.db.execute(
+        "SELECT rationale FROM supersession WHERE old_id = ? AND new_id = ?", (a, b)
+    ).fetchone()[0]
+    assert stored == "sign error"
+
+
+def test_a_partly_bad_edge_list_writes_nothing(store, mk):
+    """Validation runs over every edge before the first one is resolved. A note
+    that exists carrying half its requested edges is the same lie one table
+    over -- and harder to notice, since the note itself looks fine."""
+    a, b = mk("a"), mk("b")
+    before = store.db.execute("SELECT COUNT(*) FROM supersession").fetchone()[0]
+    with pytest.raises(SeshatError):
+        store.create_note("c", "body", [
+            {"id": a, "retained": 0.5},
+            {"id": b, "retained": 0.5, "reason": "typo'd key"},
+        ])
+    assert store.db.execute("SELECT COUNT(*) FROM supersession").fetchone()[0] == before

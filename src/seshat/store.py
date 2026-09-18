@@ -512,11 +512,11 @@ class Store:
         if not text:
             raise SeshatError("text is required")
 
-        edges = []
-        for edge in supersedes:
-            resolution = self.resolve(str(edge["id"]))
-            retained = _check_retained(edge["retained"])
-            edges.append((resolution, retained, edge.get("why")))
+        # Validated in full before anything is resolved or written: a note that
+        # exists with only some of its requested edges would be the same lie as
+        # a dropped rationale, one table over.
+        checked = [_check_edge(edge) for edge in supersedes]
+        edges = [(self.resolve(old), retained, why) for old, retained, why in checked]
 
         note_id = self.mint_id()
         stamp = now()
@@ -1006,6 +1006,53 @@ class Store:
             (query, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+EDGE_KEYS = ("id", "retained", "why")
+"""The complete accepted key set of a `supersedes` entry. Declared once: the
+tool schema is checked against this constant rather than restating it."""
+
+# The column is `rationale` (§5.5, named that only to avoid colliding with the
+# `note` table); the argument is `why`. That mismatch is a trap the spec sets
+# itself, and it is exactly the kind a reader of the schema falls into.
+_EDGE_ALIASES = {
+    "rationale": "why",
+    "reason": "why",
+    "note": "why",
+    "old_id": "id",
+    "old": "id",
+    "note_id": "id",
+    "score": "retained",
+}
+
+
+def _check_edge(edge: Any) -> tuple[str, float, str | None]:
+    """Validate one `supersedes` entry, rejecting keys we would not read (§1).
+
+    Silently dropping an unrecognised key is a priority-2 violation: the caller
+    is told the edge was written and believes the rationale went with it, when
+    in fact it was discarded. Being wrong quietly is the one failure mode this
+    store exists to prevent, so an unknown key is an error and never a no-op.
+    """
+    if not isinstance(edge, dict):
+        raise SeshatError(
+            f"each supersedes entry must be an object with keys "
+            f"{{{', '.join(EDGE_KEYS)}}}, got {type(edge).__name__}"
+        )
+    unknown = [k for k in edge if k not in EDGE_KEYS]
+    if unknown:
+        hints = [f"{k!r} (did you mean {_EDGE_ALIASES[k]!r}?)" if k in _EDGE_ALIASES else repr(k)
+                 for k in sorted(unknown)]
+        raise SeshatError(
+            f"unknown key(s) in a supersedes entry: {', '.join(hints)}. "
+            f"Accepted keys are {', '.join(EDGE_KEYS)}. Nothing was written -- "
+            f"rejecting is deliberate, since accepting and ignoring the key "
+            f"would report success for something not recorded."
+        )
+    for required in ("id", "retained"):
+        if required not in edge:
+            raise SeshatError(f"a supersedes entry needs {required!r}; got {sorted(edge)}")
+    return str(edge["id"]), _check_retained(edge["retained"]), edge.get("why")
 
 
 def _check_retained(value: Any) -> float:

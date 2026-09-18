@@ -168,6 +168,77 @@ async def test_errors_come_back_as_tool_errors_not_crashes(tmp_path):
     assert "context()" in result.content[0].text, "point the caller at the fallback (§6.1)"
 
 
+async def test_a_misnamed_edge_key_fails_rather_than_dropping_the_rationale(tmp_path):
+    """The reported defect: `rationale` -- the column name in §5.5's schema --
+    passed where the argument is `why` was accepted and silently discarded. The
+    edge was written with a null rationale and the caller was told it succeeded,
+    which is a priority-2 violation: believing something was recorded when it
+    was not. Found only because the caller happened to re-read its own work.
+    """
+    async with await session(tmp_path) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            first = payload(await client.call_tool(
+                "note", {"desc": "original claim", "text": "tau equals p"}
+            ))
+            result = await client.call_tool("note", {
+                "desc": "corrected claim",
+                "text": "tau is about p minus a half",
+                "supersedes": [
+                    {"id": first["id"], "retained": 0.4, "rationale": "sign error"}
+                ],
+            })
+            listing = payload(await client.call_tool("context", {"limit": 50}))
+
+    assert result.is_error, "an unreadable key must not report success"
+    message = result.content[0].text
+    assert "rationale" in message and "why" in message, "name the confusion: " + message
+    assert listing["count"] == 1, "the whole write is refused, not half-applied"
+
+
+async def test_a_well_formed_edge_still_records_its_rationale(tmp_path):
+    """The other half: the rejection above must not be over-eager. Read back
+    through `chain`, the way the defect was originally caught."""
+    async with await session(tmp_path) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            first = payload(await client.call_tool(
+                "note", {"desc": "original claim", "text": "tau equals p"}
+            ))
+            second = payload(await client.call_tool("note", {
+                "desc": "corrected claim",
+                "text": "tau is about p minus a half",
+                "supersedes": [{"id": first["id"], "retained": 0.4, "why": "sign error"}],
+            }))
+            chain = payload(await client.call_tool("chain", {"id": second["id"]}))
+
+    rationales = [e.get("rationale") for e in chain["edges"]]
+    assert "sign error" in rationales, chain["edges"]
+
+
+async def test_the_declared_schema_and_the_accepted_keys_agree(tmp_path):
+    """Two statements of one rule, from opposite ends: the JSON schema the
+    client validates against and the constant the store enforces. Derived
+    independently, compared here -- a key added to one and not the other is
+    exactly how the silent-drop bug gets reintroduced.
+    """
+    from seshat.store import EDGE_KEYS
+
+    async with await session(tmp_path) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            tools = {t.name: t for t in (await client.list_tools()).tools}
+
+    schema = tools["note"].input_schema["properties"]["supersedes"]
+    assert "items" not in schema, "the rule must be stated once, not beside the union"
+    arrays = [b for b in schema["anyOf"] if b["type"] == "array"]
+    assert len(arrays) == 1, "a second, laxer array branch would make the strict one moot"
+    items = arrays[0]["items"]
+    assert items["additionalProperties"] is False
+    assert set(items["properties"]) == set(EDGE_KEYS)
+    assert set(items["required"]) == {"id", "retained"}
+
+
 async def test_concurrent_calls_share_one_connection_safely(tmp_path):
     """Sync tool bodies run in a worker thread pool, so the sqlite connection is
     touched from threads other than the one that opened it.
