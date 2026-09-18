@@ -6,7 +6,7 @@ See docs/seshat-mcp-spec.md for the design and its rationale.
 
 __version__ = "0.3.0"
 
-SPEC_VERSION = "1.3"
+SPEC_VERSION = "1.4"
 """The spec revision this build implements.
 
 Reported by `seshat info`. If docs/seshat-mcp-spec.md carries a higher version

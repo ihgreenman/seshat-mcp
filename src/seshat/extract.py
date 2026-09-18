@@ -285,6 +285,25 @@ def expectation_met(expectation: str | None, text: str | None) -> bool | None:
     return (found / len(terms)) >= EXPECTATION_COVERAGE
 
 
+_URL_IN_TEXT = re.compile(r"https?://\S+", re.I)
+
+
+def usable_expectation(text: str | None) -> bool:
+    """Could a page plausibly contain any of this? (§6.9)
+
+    The bar is deliberately low and deliberately present: at least one content
+    word with a letter in it. A fragment that reduces to punctuation, to a
+    regex literal, or to a stray list numeral asserts something no page will
+    ever satisfy, and unlike a wrong verdict it cannot be cleared -- it sits in
+    §10.2's review queue forever. A queue that cries wolf trains the reviewer
+    to stop reading it.
+
+    `None` says *unknown*, which is true. That is strictly better than a
+    garbage string, which says something false and costs attention to dismiss.
+    """
+    return any(any(c.isalpha() for c in term) for term in expectation_terms(text))
+
+
 def choose_expectation(
     label: str | None, desc: str, sentence: str | None = None
 ) -> tuple[str | None, str | None]:
@@ -303,8 +322,21 @@ def choose_expectation(
     from .snapshots import DEGENERATE_LABELS
 
     cleaned = (label or "").strip()
-    if cleaned and cleaned.lower() not in DEGENERATE_LABELS:
+    # A label with no word in it states no expectation, which is what
+    # DEGENERATE_LABELS is for -- it just cannot enumerate every such form.
+    if cleaned and cleaned.lower() not in DEGENERATE_LABELS and usable_expectation(cleaned):
         return cleaned, "anchor"
+
     if sentence and sentence.strip():
-        return f"{desc} -- {sentence.strip()}"[:500], "sentence"
-    return (desc or None), ("desc" if desc else None)
+        # The URL itself is not something the page can be expected to contain;
+        # keeping it adds `https`, the host and path segments as content words
+        # and dilutes the coverage fraction with terms that mean nothing.
+        trimmed = " ".join(_URL_IN_TEXT.sub(" ", sentence).split())
+        candidate = f"{desc} -- {trimmed}"[:500] if trimmed else desc
+        if usable_expectation(candidate):
+            return candidate, "sentence"
+
+    if desc and usable_expectation(desc):
+        return desc, "desc"
+    # Nothing here a target could plausibly contain. §6.9: store no expectation.
+    return None, None

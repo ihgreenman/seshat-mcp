@@ -56,14 +56,27 @@ the new one:
   1.0  the new note adds; the old is still entirely correct
   0.5  the old note was partly right
   0.0  full retraction; the old note was wrong
-`why` is optional free text explaining the score.
+`why` is optional free text explaining the score. One score conflates two
+different facts, so when `retained` records a RESTRICTION rather than a
+DEGRADATION, open `why` with one of these prefixes:
+
+  scope:   the old note is correct within stated bounds; the new one narrows it
+  wrong:   the old note was mistaken in the part not retained
+  source:  superseded by better evidence, not by better reasoning
+
+  scope: holds for fixed-point implementations; the float path is unaffected
+
+That set is closed. Anything else is free prose -- do not invent `narrowed:`
+or `partial:`, because an open vocabulary is unparseable within months.
 
 TWO THINGS ABOUT WRITING NOTES WELL:
 
 1. Use markdown links with real anchor text. `[texas population data](url)`
    states what you wanted from that page, and seshat stores that alongside the
    captured content so a paywall or a moved page can be spotted later. "here"
-   or "this article" carries no such information.
+   or "this article" carries no such information. Reference-style links carry
+   it too: `[rate limits][rl]` works as well as the inline form. Autolinks and
+   bare URLs carry none, so a note citing one is judged against its `desc`.
 
 2. Keep a capture and an analysis as SEPARATE notes. One note says what a
    source contains; a second references the first by id and says what follows
@@ -126,7 +139,16 @@ Record, after the fact, that one existing note supersedes another.
 Use this when you realise a note you wrote earlier invalidates or extends an
 older one. Called on a pair that already has an edge, it records a
 RE-ASSESSMENT of `retained` rather than failing -- the old score is kept in
-history. Edges that would make the graph cyclic are rejected."""
+history. Edges that would make the graph cyclic are rejected.
+
+`why` takes the same closed prefix set as `note`, for the same reason -- a bare
+score cannot say whether the old note was WRONG or merely OVERGENERALISED:
+
+  scope:   the old note is correct within stated bounds; the new one narrows it
+  wrong:   the old note was mistaken in the part not retained
+  source:  superseded by better evidence, not by better reasoning
+
+Anything else is free prose. Do not extend the set."""
 
 HELP_DESCRIPTION = """\
 Report what this server actually is: which revision of the seshat spec it

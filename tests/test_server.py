@@ -294,3 +294,40 @@ def test_stdout_carries_only_json_rpc(tmp_path):
         message = json.loads(line)  # raises if anything else reached stdout
         assert message["jsonrpc"] == "2.0"
     assert "seshat store:" in proc.stderr, "logging must go to stderr"
+
+
+# ------------------------------------------- §5.6 rationale prefix convention
+
+
+def test_both_tool_descriptions_document_the_prefix_set():
+    """§5.6: "Document the set in `note`'s and `supersedes`' tool descriptions,
+    where a writer will see it; a convention documented only here will not be
+    followed." Both, because either tool can write a rationale."""
+    from seshat.server import NOTE_DESCRIPTION, SUPERSEDES_DESCRIPTION
+    from seshat.store import RATIONALE_PREFIXES
+
+    for description in (NOTE_DESCRIPTION, SUPERSEDES_DESCRIPTION):
+        for prefix in RATIONALE_PREFIXES:
+            assert prefix in description
+        assert "closed" in description or "Do not extend" in description
+
+
+def test_the_prefix_set_matches_the_spec():
+    """The set is closed, so the code and the document must agree on what is in
+    it. Read out of the spec's own table rather than restated here -- a copy in
+    the test would drift with the copy in the code and agree with it anyway.
+    """
+    import re
+    from pathlib import Path
+
+    from seshat.store import RATIONALE_PREFIXES
+
+    spec = (Path(__file__).resolve().parent.parent / "docs" / "seshat-mcp-spec.md").read_text()
+    section = spec[spec.index("### 5.6"):]
+    section = section[: section.index("\n## ")]
+    # The table rows look like: | `scope:` | the old note is correct ... |
+    in_spec = tuple(re.findall(r"^\|\s*`([a-z]+:)`\s*\|", section, re.M))
+    assert in_spec, "no prefix table found in §5.6"
+    assert set(in_spec) == set(RATIONALE_PREFIXES), (
+        f"spec lists {sorted(in_spec)}, code declares {sorted(RATIONALE_PREFIXES)}"
+    )

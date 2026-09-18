@@ -803,3 +803,21 @@ def test_the_ui_says_so_when_it_has_only_keyword_results(tmp_path):
     finally:
         httpd.shutdown()
         review.close()
+
+
+@pytest.mark.parametrize(
+    "host,loopback",
+    [("::ffff:127.0.0.1", True), ("::ffff:8.8.8.8", False), ("::ffff:10.0.0.1", False)],
+)
+def test_ipv4_mapped_forms_are_classified_correctly(host, loopback):
+    """§10 names these as the usual way a literal-matching check goes wrong in
+    both directions: ::ffff:127.0.0.1 refused though it reaches only this
+    machine, or ::ffff:8.8.8.8 accepted because it starts with a colon.
+
+    Resolving rather than comparing strings gets both right, which is the
+    argument for it. Pinned here so a later "simplification" to string matching
+    fails instead of quietly regressing.
+    """
+    from seshat.review import is_loopback
+
+    assert is_loopback(host) is loopback

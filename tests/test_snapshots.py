@@ -764,3 +764,33 @@ def test_a_redirect_to_a_public_target_still_follows(monkeypatch):
     )
     assert followed is not None
     assert followed.full_url == "https://example.com/landed"
+
+
+def test_reference_style_anchor_text_reaches_the_expectation(tmp_path):
+    """§6.9's implementation consequence, stated end to end rather than at the
+    extractor: what matters is not that `link.label` is populated but that the
+    witness is judged against what the citation actually said it wanted.
+
+    Reading it off `link` would not do -- §6.9 requires the expectation be
+    COPIED into `snapshot`, because `link` is derived and re-extractable, and a
+    later revision could leave a 2024 capture judged against 2026 intent.
+    """
+    snaps = SnapshotStore(snapshot_path_for(tmp_path / "n.db"))
+    store = Store(tmp_path / "n.db", snapshots=snaps)
+    store.create_note(
+        "API ceilings",
+        "Inline [texas population data](https://example.gov/tx).\n\n"
+        "Reference: see [rate limits][rl] for the ceiling.\n\n"
+        "Autolink: <https://example.com/auto>\n\n"
+        "[rl]: https://example.com/limits\n",
+    )
+    queued = {
+        row["target"]: (row["expectation"], row["expectation_source"])
+        for row in snaps.db.execute(
+            "SELECT target, expectation, expectation_source FROM fetch_queue"
+        )
+    }
+    assert queued["https://example.gov/tx"] == ("texas population data", "anchor")
+    assert queued["https://example.com/limits"] == ("rate limits", "anchor")
+    # An autolink carries no anchor text, so it takes the fallback -- correctly.
+    assert queued["https://example.com/auto"][1] != "anchor"

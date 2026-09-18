@@ -3,7 +3,7 @@
 import pytest
 
 from seshat import ids
-from seshat.links import Link, extract, strip_code_fences
+from seshat.links import Link, extract, sentence_containing, strip_code_fences
 
 
 def targets(text, kind=None, **kw):
@@ -146,3 +146,112 @@ def test_the_specs_own_example_id_is_not_a_valid_bip39_id():
     # A well-formed id made of real words is extracted.
     assert ids.canonicalize("olive-canvas-bright-zebra") == "olive-canvas-bright-zebra"
     assert targets("see olive-canvas-bright-zebra", kind="note") == ["olive-canvas-bright-zebra"]
+
+
+# ------------------------------------------- §6.9: every form carrying a label
+
+
+REFERENCE_NOTE = """\
+Inline: [texas population data](https://example.gov/tx) here.
+
+Reference: see [rate limits][rl] for the ceiling.
+
+Collapsed: see [cache policy][] too.
+
+Shortcut: see [quota rules] as well.
+
+Autolink: <https://example.com/auto>
+
+Bare: https://example.com/bare
+
+Ordinary [bracketed prose] with no definition must stay prose.
+
+[rl]: https://example.com/limits
+[cache policy]: https://example.com/collapsed "with a title"
+[quota rules]: <https://example.com/shortcut>
+"""
+
+
+def _labels(text):
+    return {link.target: link.label for link in extract(text)}
+
+
+@pytest.mark.parametrize(
+    "target,label",
+    [
+        ("https://example.gov/tx", "texas population data"),
+        ("https://example.com/limits", "rate limits"),
+        ("https://example.com/collapsed", "cache policy"),
+        ("https://example.com/shortcut", "quota rules"),
+    ],
+)
+def test_every_link_form_carrying_anchor_text_yields_it(target, label):
+    """§6.9: the label in `[rate limits][rl]` is the author's statement of
+    intent every bit as much as the inline form's. Dropping it silently demotes
+    that capture to the desc fallback for no reason the author can see."""
+    assert _labels(REFERENCE_NOTE)[target] == label
+
+
+@pytest.mark.parametrize(
+    "target", ["https://example.com/auto", "https://example.com/bare"]
+)
+def test_forms_without_anchor_text_have_none(target):
+    """Autolinks and bare URLs genuinely carry no expectation, and the fallback
+    is correct for those -- a label invented for them would be worse."""
+    assert _labels(REFERENCE_NOTE)[target] is None
+
+
+def test_bracketed_prose_without_a_definition_is_not_a_link():
+    """CommonMark's own rule, and the thing that keeps shortcut references from
+    turning every bracketed aside into a dangling reference."""
+    found = extract("Ordinary [bracketed prose] with no definition.")
+    assert found == []
+
+
+def test_a_definition_nothing_uses_still_yields_its_url():
+    """The URL is in the note whether or not a label points at it. It just has
+    no anchor text, so it takes the fallback path like a bare URL."""
+    found = extract("Nothing references it.\n\n[unused]: https://example.com/orphan")
+    assert [(link.target, link.label) for link in found] == [
+        ("https://example.com/orphan", None)
+    ]
+
+
+def test_a_reference_label_matches_case_and_whitespace_insensitively():
+    """CommonMark normalises link labels. A definition written `[Rate  Limits]`
+    must answer a use written `[rate limits]`."""
+    text = "See [docs][Rate  Limits] now.\n\n[rate limits]: https://example.com/x"
+    assert _labels(text)["https://example.com/x"] == "docs"
+
+
+# ------------------------------------------- §6.9: a sentence is not a list
+
+
+def test_a_sentence_does_not_run_past_a_list_item():
+    """The failure §6.9 records: a fallback expectation that ran past the end of
+    one list item and swallowed the numeral starting the next. A numbered list
+    is not prose, and treating it as prose makes "2." a clause."""
+    note = (
+        "1. First check https://example.gov/data for the figures\n"
+        "2. Then apply the filter"
+    )
+    sentence = sentence_containing(note, "https://example.gov/data")
+    assert sentence == "First check https://example.gov/data for the figures"
+    assert "2." not in sentence
+    assert "Then apply" not in sentence
+
+
+@pytest.mark.parametrize("marker", ["-", "*", "+", "1.", "2)", ">", "##"])
+def test_every_block_marker_ends_a_sentence(marker):
+    """Bullets, ordered markers, quotes and headings all open a block."""
+    note = f"See https://example.gov/data here\n{marker} something else entirely"
+    sentence = sentence_containing(note, "https://example.gov/data")
+    assert "something else entirely" not in sentence
+
+
+def test_prose_still_wraps_across_lines():
+    """The fix must not go the other way. Ordinary prose does wrap, and a
+    sentence split at every newline would truncate most real citations."""
+    note = "See the figures at https://example.gov/data\nwhich cover every county."
+    sentence = sentence_containing(note, "https://example.gov/data")
+    assert sentence.endswith("which cover every county.")

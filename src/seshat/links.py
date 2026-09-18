@@ -38,6 +38,21 @@ _HASH = re.compile(
 )
 _MAYBE_ID = re.compile(r"(?<![\w-])([a-z]{3,8}(?:-[a-z]{3,8}){%d})(?![\w-])" % (WORD_COUNT - 1), re.I)
 
+# Reference-style links. §6.9: every CommonMark form that carries anchor text
+# must yield it -- the label in `[rate limits][rl]` is the author's statement of
+# intent every bit as much as the inline form's, and dropping it silently
+# demotes that capture to the desc fallback for no reason the author can see.
+_REF_DEF = re.compile(
+    r"""^[ ]{0,3}\[([^\]\n]+)\]:[ \t]*<?([^>\s]+)>?[ \t]*
+        (?:"[^"\n]*"|'[^'\n]*'|\([^)\n]*\))?[ \t]*$""",
+    re.M | re.X,
+)
+# `[text][ref]` and the collapsed `[text][]`, which means `[text][text]`.
+_REF_FULL = re.compile(r"\[([^\]\n]+)\]\[([^\]\n]*)\]")
+# `[text]` alone. Only resolves against a real definition, which is what keeps
+# ordinary bracketed prose from becoming a link -- CommonMark's own rule.
+_REF_SHORTCUT = re.compile(r"\[([^\]\n]+)\](?!\s*[\[(:])")
+
 # Punctuation that ends a sentence rather than a URL. Balanced parens are left
 # alone -- Wikipedia targets genuinely contain them.
 _TRAILING = ".,;:!?'\"»”’"
@@ -77,6 +92,19 @@ def _trim_url(url: str) -> str:
     return url
 
 
+def _normalise_label(label: str) -> str:
+    """CommonMark matches link labels case-insensitively, whitespace-collapsed."""
+    return " ".join(label.split()).lower()
+
+
+def reference_definitions(body: str) -> dict[str, str]:
+    """Map of normalised link label -> target, from reference definitions."""
+    return {
+        _normalise_label(match.group(1)): _trim_url(match.group(2))
+        for match in _REF_DEF.finditer(body)
+    }
+
+
 def extract(text: str, exclude: str | None = None) -> list[Link]:
     """Pull references out of note text (§6.5).
 
@@ -108,6 +136,26 @@ def extract(text: str, exclude: str | None = None) -> list[Link]:
         body = " ".join(pieces)
 
     consume(_MD_LINK, lambda m: add("url", _trim_url(m.group(2)), m.group(1).strip()))
+
+    # Before the bare-URL pass, which would otherwise reach the definition lines
+    # first and record their targets with no label at all (§6.9). `add` keeps
+    # the first entry for a target, so the labelled form has to win the race.
+    definitions = reference_definitions(body)
+    if definitions:
+
+        def reference(match: re.Match[str]) -> None:
+            label = match.group(1).strip()
+            # The shortcut pattern has one group; the full one has two, whose
+            # second is empty for the collapsed form `[text][]` == `[text][text]`.
+            explicit = match.group(2).strip() if match.re.groups > 1 else ""
+            key = explicit or label
+            target = definitions.get(_normalise_label(key))
+            if target:
+                add("url", target, label)
+
+        consume(_REF_FULL, reference)
+        consume(_REF_SHORTCUT, reference)
+
     consume(_BARE_URL, lambda m: add("url", _trim_url(m.group(0))))
     consume(_HASH, lambda m: add(
         "hash",
@@ -125,17 +173,49 @@ def extract(text: str, exclude: str | None = None) -> list[Link]:
 
 
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
+# A line that opens a new block: list item, heading, or block quote. §6.9
+# observed the cost of ignoring these -- a fallback expectation that ran past
+# the end of one list item and swallowed the numeral starting the next.
+_BLOCK_START = re.compile(r"^\s{0,3}(?:[-*+]\s|\d{1,9}[.)]\s|#{1,6}\s|>)")
+
+
+def _blocks(text: str) -> list[str]:
+    """Split text where a sentence cannot run on: blank lines and block markers.
+
+    A numbered list is not prose, and treating it as prose makes "1." the end
+    of a sentence and "2." the start of the next clause. Blocks are joined with
+    spaces internally, because ordinary prose does wrap across lines.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        if current and _BLOCK_START.match(line):
+            blocks.append(current)
+            current = []
+        current.append(line)
+    if current:
+        blocks.append(current)
+    return [" ".join(block) for block in blocks]
 
 
 def sentence_containing(text: str, target: str) -> str | None:
     """The sentence a link sits in, for §6.9's expectation fallback.
 
     Used only when the anchor text is missing or degenerate, so the cost of a
-    crude sentence splitter is a slightly long expectation string rather than a
-    wrong one.
+    crude splitter is a slightly long expectation rather than a wrong one --
+    but only within a block. Across blocks the cost is a *wrong* one, which is
+    why block boundaries are found before sentences are.
     """
-    for chunk in _SENTENCE.split(text.replace("\n", " ")):
-        if target in chunk:
-            cleaned = " ".join(chunk.split())
-            return cleaned or None
+    for block in _blocks(text):
+        if target not in block:
+            continue
+        for chunk in _SENTENCE.split(block):
+            if target in chunk:
+                cleaned = " ".join(chunk.split())
+                return cleaned or None
     return None

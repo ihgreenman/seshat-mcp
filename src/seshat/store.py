@@ -1008,6 +1008,17 @@ class Store:
         return [dict(r) for r in rows]
 
 
+RATIONALE_PREFIXES = ("scope:", "wrong:", "source:")
+"""§5.6's closed prefix set for `why`. Convention, not schema -- nothing here
+parses it, and a rationale using none of these is perfectly valid free prose.
+
+Declared as a constant anyway, for the reason §5.6 gives: an open convention is
+unparseable within months, because a writer will invent `narrowed:`,
+`partial:`, `context:` unless the vocabulary is enumerated somewhere actually
+read. The tool descriptions and the spec table are both checked against this,
+so the three cannot drift apart."""
+
+
 EDGE_KEYS = ("id", "retained", "why")
 """The complete accepted key set of a `supersedes` entry. Declared once: the
 tool schema is checked against this constant rather than restating it."""

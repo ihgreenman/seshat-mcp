@@ -10,6 +10,8 @@ import pytest
 from seshat.extract import (
     THIN_CHARS,
     Extraction,
+    choose_expectation,
+    expectation_met,
     extract,
     is_textual,
     is_thin,
@@ -156,3 +158,70 @@ def test_looks_like_html_prefers_the_header_over_sniffing():
     assert looks_like_html("text/html", b"not markup at all") is True
     assert looks_like_html("text/plain", b"<html><body>") is False
     assert looks_like_html(None, b"<!DOCTYPE html><html>") is True
+
+
+# --------------------------------- §6.9: a null expectation beats a bad one
+
+
+def test_a_fallback_with_no_plausible_content_word_stores_nothing():
+    """§6.9: a fragment that reduces to a regex literal asserts something no
+    page will ever satisfy. Unlike a wrong verdict it cannot be cleared -- it
+    sits in the review queue forever, and a queue that cries wolf trains the
+    reviewer to stop reading it."""
+    assert choose_expectation(None, "", "/^[a-z]+$/") == (None, None)
+    assert choose_expectation(None, "", "-- 2. --") == (None, None)
+    assert choose_expectation(None, "", None) == (None, None)
+
+
+def test_null_is_not_the_same_as_unmet():
+    """"Not checked" and "checked and failed" are different facts, and only one
+    of them belongs in a review queue."""
+    assert expectation_met(None, "any page text at all") is None
+    assert expectation_met("", "any page text at all") is None
+
+
+def test_an_anchor_with_no_word_in_it_falls_back():
+    """DEGENERATE_LABELS cannot enumerate every form that states no
+    expectation. A label of pure punctuation is one it does not list."""
+    assert choose_expectation("»", "Texas population figures", None) == (
+        "Texas population figures",
+        "desc",
+    )
+
+
+def test_a_real_anchor_still_wins():
+    """The guard must not reach past the case it exists for: anchor text is the
+    expectation whenever there is any."""
+    assert choose_expectation(
+        "texas population data", "some note desc", "a sentence"
+    ) == ("texas population data", "anchor")
+
+
+def test_the_url_is_stripped_from_a_sentence_fallback():
+    """The page cannot be expected to contain its own URL, and keeping it adds
+    `https`, the host and the path segments as content words -- diluting the
+    coverage fraction with terms that mean nothing."""
+    expectation, source = choose_expectation(
+        None, "population figures", "First check https://example.gov/data for them"
+    )
+    assert source == "sentence"
+    assert "https" not in expectation
+    assert "example" not in expectation
+    assert "population figures" in expectation
+
+
+def test_the_desc_alone_is_used_when_there_is_no_sentence():
+    assert choose_expectation(None, "Texas population figures", None) == (
+        "Texas population figures",
+        "desc",
+    )
+
+
+def test_a_stored_expectation_is_one_the_target_could_satisfy():
+    """The end-to-end property, stated as §6.9 states it: whatever is stored,
+    a page containing the cited material should be able to meet it."""
+    expectation, _ = choose_expectation(
+        None, "population figures", "First check https://example.gov/data for them"
+    )
+    page = "Population figures for every county, with the full tables below."
+    assert expectation_met(expectation, page) is True
