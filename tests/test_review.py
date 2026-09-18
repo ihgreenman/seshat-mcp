@@ -821,3 +821,97 @@ def test_ipv4_mapped_forms_are_classified_correctly(host, loopback):
     from seshat.review import is_loopback
 
     assert is_loopback(host) is loopback
+
+
+def test_the_weak_match_caveat_needs_something_to_be_weak(tmp_path):
+    """`all()` over an empty sequence is True, so filtering the Nones out and
+    then asking "are they all low" claimed every result was weakly matched
+    precisely when none had a similarity at all -- printed under the banner
+    correctly saying the vector side did not answer. Two contradictory claims
+    on one page, one of them false."""
+    from seshat.review import render_search
+
+    store = Store(tmp_path / "n.db")
+    store.create_note("Bilinear transform near Nyquist", "the error is measurable")
+    store.close()
+
+    review = Review(tmp_path / "n.db", snapshots=False, capture_api=False)
+    try:
+        # No embedder, so every hit carries vector_similarity=None.
+        page = render_search(review, "bilinear")
+        assert "did not answer" in page, "the degraded banner should still show"
+        assert "weakly matched" not in page
+    finally:
+        review.close()
+
+
+def test_the_weak_match_caveat_still_fires_when_matches_are_weak():
+    """The guard must not reach past the case it exists for."""
+    from seshat.review import render_search
+    from seshat.store import Hit
+
+    class Fake:
+        snapshots = None
+
+        class store:
+            @staticmethod
+            def context(query, limit=40):
+                return [Hit("a-b-c-d", "something", 0.016, 0.21, ("fts", "vector"))]
+
+    page = render_search(Fake(), "bilinear")
+    assert "weakly matched" in page
+
+
+def test_a_similarity_of_exactly_zero_counts_as_a_similarity():
+    """0.0 is a measurement, not a missing one. Testing truthiness rather than
+    `is not None` silently drops it."""
+    from seshat.review import render_search
+    from seshat.store import Hit
+
+    class Fake:
+        snapshots = None
+
+        class store:
+            @staticmethod
+            def context(query, limit=40):
+                return [Hit("a-b-c-d", "something", 0.016, 0.0, ("vector",))]
+
+    assert "weakly matched" in render_search(Fake(), "bilinear")
+
+
+def test_the_api_token_is_never_briefly_world_readable(tmp_path):
+    """Written 0600, not written and then narrowed. It is the only thing
+    standing between any page you visit and the note store, and `write_text`
+    followed by `chmod` leaves it at the umask default in between."""
+    import os
+    import stat
+
+    from seshat.review import load_token, token_path
+
+    Store(tmp_path / "n.db").close()
+    # Umask 0 deliberately: under a restrictive umask this test passes even with
+    # the bug present, because the umask does the narrowing the code failed to.
+    # A test whose result depends on the developer's shell settings is not a
+    # test of the code.
+    previous = os.umask(0)
+    try:
+        load_token(tmp_path / "n.db")
+    finally:
+        os.umask(previous)
+    mode = stat.S_IMODE(token_path(tmp_path / "n.db").stat().st_mode)
+    assert mode == 0o600, f"token file is {oct(mode)}"
+
+
+def test_a_pre_existing_loose_token_file_is_narrowed(tmp_path):
+    """The open mode only applies to a fresh inode, so a file left behind by an
+    older build with looser bits would keep them."""
+    import stat
+
+    from seshat.review import load_token, token_path
+
+    Store(tmp_path / "n.db").close()
+    path = token_path(tmp_path / "n.db")
+    path.write_text("")  # present but empty: the build treats it as unset
+    path.chmod(0o644)
+    load_token(tmp_path / "n.db")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600

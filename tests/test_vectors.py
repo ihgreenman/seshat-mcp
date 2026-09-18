@@ -432,3 +432,34 @@ def test_recency_listing_reports_null_not_zero(vstore):
     assert hit.score is None
     assert hit.vector_similarity is None
     assert hit.matched is None
+
+
+def test_reembed_clears_the_vectors_even_during_a_failure_cooldown(tmp_path):
+    """`clear_embeddings` gated on `vector_ready`, which folds in the 30-second
+    cooldown after an embedder failure. So an embedder that flaked just before a
+    `seshat reembed` left note_vec populated while its provenance was cleared --
+    and the next search ranked against a model nothing recorded."""
+    import time
+
+    class Fixed:
+        model = "m"
+        dim = 4
+
+        def embed(self, texts, timeout=0):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    store = Store(tmp_path / "n.db", embedder=Fixed())
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+    store.create_note("alpha", "a note")
+    EmbeddingWorker(store).drain()
+    assert store.db.execute("SELECT COUNT(*) FROM note_vec").fetchone()[0] == 1
+
+    store._vector_cooldown_until = time.monotonic() + 30
+    assert not store.vector_ready
+    store.clear_embeddings()
+
+    assert store.db.execute("SELECT COUNT(*) FROM embedding_meta").fetchone()[0] == 0
+    assert store.db.execute("SELECT COUNT(*) FROM note_vec").fetchone()[0] == 0, (
+        "vectors outlived the provenance that described them"
+    )

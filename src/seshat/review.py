@@ -35,6 +35,7 @@ import html
 import ipaddress
 import json
 import logging
+import os
 import secrets
 import socket
 import threading
@@ -120,8 +121,17 @@ def load_token(db_path: Path) -> str:
         if existing:
             return existing
     token = secrets.token_urlsafe(32)
-    path.write_text(token + "\n")
-    path.chmod(0o600)
+    # Created 0600, not created and then narrowed. `write_text` followed by
+    # `chmod` leaves the secret at the umask default for the width of two
+    # syscalls, and on a shared machine that window is the whole protection.
+    # `fchmod` as well as the open mode, in case the path already existed with
+    # looser bits -- the mode argument only applies to a fresh inode.
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        os.write(descriptor, (token + "\n").encode())
+    finally:
+        os.close(descriptor)
     return token
 
 
@@ -469,8 +479,15 @@ def render_search(review: Review, query: str) -> str:
         + "</div></div>"
         for h in hits
     )
+    # `all()` over an empty sequence is True, so filtering the Nones out first
+    # and then asking "are they all low" claimed every result was weakly matched
+    # precisely when NONE of them had a similarity at all -- printed directly
+    # under the banner correctly saying the vector side did not answer. Two
+    # contradictory claims, one of them false. A similarity of exactly 0.0 is
+    # also a similarity, so the test is `is not None`, not truthiness.
+    similarities = [h.vector_similarity for h in hits if h.vector_similarity is not None]
     caveat = ""
-    if hits and all((h.vector_similarity or 0) < 0.6 for h in hits if h.vector_similarity):
+    if similarities and all(value < 0.6 for value in similarities):
         caveat = ('<div class="card warn">Every result is weakly matched. The store '
                   'may simply hold nothing on this.</div>')
     return f"""<h1>Search</h1><p class="dim">{E(query)}</p>{degraded}{caveat}

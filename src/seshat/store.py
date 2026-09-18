@@ -833,10 +833,20 @@ class Store:
         ).fetchall()
         return [r["id"] for r in rows]
 
-    def _vector_ranking(
-        self, text: str, since: str | None, limit: int
-    ) -> tuple[list[str], dict[str, float], list[float]] | None:
-        """Semantic ranking, or None if the vector side cannot answer right now.
+    def _embed_query(self, text: str) -> list[float] | None:
+        """Embed a query, or None if the vector side cannot answer right now.
+
+        **Called OUTSIDE the store lock, and that is the point.** This is a
+        network round trip bounded by `QUERY_TIMEOUT`, and the lock spans whole
+        operations, so holding it here makes every write wait out a cold Ollama
+        -- up to ten seconds. `worker.py` states the invariant that follows from
+        priority 1: writes must not block on embedding. It held on the write
+        path, where embedding is off it entirely, and was defeated transitively
+        through a mutex taken for an unrelated reason. Measured before the fix:
+        a 2s embedder stalled `create_note` for 1.8s.
+
+        Nothing here touches store state. The cooldown stamp is a single float
+        write, and a torn read of it costs one wasted embed attempt.
 
         None is a legitimate, expected outcome (§6.3): no extension, no
         embedder, a cold Ollama, or simply nothing embedded yet. Every one of
@@ -845,15 +855,12 @@ class Store:
         if not self.vector_ready or self.embedder is None:
             return None
         try:
-            vector = embeddings.embed_query(self.embedder, text)
+            return embeddings.embed_query(self.embedder, text)
         except Exception as exc:
             log.info("vector side unavailable for this query (%s); using FTS only", exc)
             self._vector_cooldown_until = time.monotonic() + VECTOR_COOLDOWN
             return None
-        scored = vectors.search(self.db, vector, self.theta, limit, since)
-        return [i for i, _ in scored], dict(scored), vector
 
-    @synchronized
     def context(
         self, text: str = "", since: str | None = None, limit: int = DEFAULT_LIMIT
     ) -> list[Hit]:
@@ -869,22 +876,28 @@ class Store:
         edges only -- no path composition, so the diamond resolves without
         traversal.
         """
+        since = _check_since(since)
         query = fts_query(text)
         if query is None:
             # Empty or unusable query: recency listing. There is nothing for
             # either retriever to match on, so no fusion happens.
-            return self._recency_listing(since, limit)
+            with self._lock:
+                return self._recency_listing(since, limit)
 
-        keyword = self._fts_ranking(query, since, limit)
-        contributors: dict[str, list[str]] = {"fts": keyword}
-        rankings = [keyword]
-        query_vector = None
-        semantic = self._vector_ranking(text, since, limit)
-        if semantic is not None:
-            ids_, _, query_vector = semantic
-            contributors["vector"] = ids_
-            rankings.append(ids_)
-        return self._hydrate(fuse(rankings), limit, contributors, query_vector)
+        # Deliberately before the lock: see `_embed_query`. Every statement
+        # after this one touches the database and every one before it does not.
+        query_vector = self._embed_query(text)
+
+        with self._lock:
+            keyword = self._fts_ranking(query, since, limit)
+            contributors: dict[str, list[str]] = {"fts": keyword}
+            rankings = [keyword]
+            if query_vector is not None and self.vector_ready:
+                scored = vectors.search(self.db, query_vector, self.theta, limit, since)
+                found = [note_id for note_id, _ in scored]
+                contributors["vector"] = found
+                rankings.append(found)
+            return self._hydrate(fuse(rankings), limit, contributors, query_vector)
 
     def _recency_listing(self, since: str | None, limit: int) -> list[Hit]:
         """§3.2: ordered by recency, with every retrieval field null."""
@@ -989,7 +1002,13 @@ class Store:
         count = self.db.execute("SELECT COUNT(*) FROM embedding_meta").fetchone()[0]
         with self.db:
             self.db.execute("DELETE FROM embedding_meta")
-            if self.vector_ready:
+            # `vector_loaded`, not `vector_ready`: the question is whether the
+            # table exists, and `vector_ready` also folds in the failure
+            # cooldown. Gated on that, an embedder that flaked in the last 30
+            # seconds left `note_vec` populated while its provenance was
+            # cleared -- so `seshat reembed` under a different model would leave
+            # the old model's vectors ranking results that nothing recorded.
+            if self.vector_loaded:
                 self.db.execute("DELETE FROM note_vec")
         return count
 
@@ -1064,6 +1083,39 @@ def _check_edge(edge: Any) -> tuple[str, float, str | None]:
         if required not in edge:
             raise SeshatError(f"a supersedes entry needs {required!r}; got {sorted(edge)}")
     return str(edge["id"]), _check_retained(edge["retained"]), edge.get("why")
+
+
+def _check_since(since: str | None) -> str | None:
+    """Normalise an ISO 8601 lower bound to the store's own timestamp format.
+
+    Two silent wrong answers live here, and both return an empty result set
+    rather than an error -- which a caller reads as "the store holds nothing".
+
+    The first is anything unparseable. `since="yesterday"` sorts above every
+    real timestamp, because the comparison is a string comparison, so the query
+    matches nothing and says so confidently.
+
+    The second is subtler and survives validation: an offset-bearing timestamp
+    compared as text is compared as though it were UTC, so
+    `2026-09-18T00:00:00-05:00` silently means 00:00 UTC rather than 05:00.
+    Parsing and re-serialising in the stored format is what makes the string
+    comparison in SQL equivalent to a comparison of instants.
+    """
+    if since is None or not str(since).strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(since).strip())
+    except ValueError:
+        raise SeshatError(
+            f"since={since!r} is not ISO 8601. Expected a date or timestamp such as "
+            f"'2026-09-18' or '2026-09-18T14:30:00Z'; relative expressions like "
+            f"'yesterday' are not understood. Nothing was searched -- an unparsed "
+            f"bound would have matched nothing and reported an empty store."
+        ) from None
+    if parsed.tzinfo is None:
+        # Naive input means UTC here, matching how every stored stamp is written.
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _check_retained(value: Any) -> float:

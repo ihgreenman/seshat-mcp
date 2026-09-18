@@ -3,7 +3,8 @@ Spec §3.2, §5.1, §6."""
 
 import pytest
 
-from seshat.store import RRF_K, Store, fts_query
+from seshat.store import RRF_K, SeshatError, Store, fts_query
+from seshat.worker import EmbeddingWorker
 
 
 def test_empty_query_is_a_recency_listing(store):
@@ -195,3 +196,108 @@ def test_the_cli_renders_a_recency_listing(store, capsys, tmp_path):
     out = capsys.readouterr().out
     assert "a finding" in out
     assert "recency" in out, "say which retriever ran, and none did"
+
+
+# ------------------------------------------------ §3.2 `since` is a real bound
+
+
+def test_an_unparseable_since_is_refused_rather_than_matching_nothing():
+    """The comparison is a string comparison, so "yesterday" sorts above every
+    real timestamp and the query confidently returns nothing. A caller reads an
+    empty result as "the store holds nothing on this" -- a silent wrong answer,
+    which is the failure class this store exists to prevent."""
+    store = Store(":memory:")
+    store.create_note("alpha", "a note about bilinear transforms")
+    assert len(store.context("bilinear")) == 1
+
+    for bad in ("yesterday", "last week", "18/09/2026", "next tuesday"):
+        with pytest.raises(SeshatError, match="ISO 8601"):
+            store.context("bilinear", since=bad)
+
+
+def test_an_offset_bearing_since_compares_as_an_instant():
+    """Validation alone would not have caught this one. A timestamp carrying a
+    +05:00 offset reads, as text, four hours later than it is -- so a bound an
+    hour BEFORE a note excluded it.
+
+    The expected answer is derived from the instants, not from the strings: the
+    bound precedes the note, therefore the note is in range, whatever the two
+    representations look like side by side.
+    """
+    import datetime as dt
+
+    store = Store(":memory:")
+    store.create_note("alpha", "a note about bilinear transforms")
+    created = store.db.execute("SELECT created_at FROM note").fetchone()[0]
+
+    bound = (dt.datetime.fromisoformat(created) - dt.timedelta(hours=1)).astimezone(
+        dt.timezone(dt.timedelta(hours=5))
+    )
+    assert bound.isoformat() > created, "this case does not discriminate; pick another offset"
+    assert len(store.context("bilinear", since=bound.isoformat())) == 1
+
+
+def test_since_is_validated_on_the_recency_listing_too():
+    """An empty query is still a query with a bound on it."""
+    store = Store(":memory:")
+    store.create_note("alpha", "some body")
+    with pytest.raises(SeshatError, match="ISO 8601"):
+        store.context("", since="yesterday")
+
+
+def test_a_naive_since_is_read_as_utc():
+    """Every stored stamp is UTC, so a bound without an offset means UTC. The
+    alternative -- local time -- would make results depend on the machine."""
+    import datetime as dt
+
+    store = Store(":memory:")
+    store.create_note("alpha", "a note about bilinear transforms")
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1)).replace(tzinfo=None)
+    future = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).replace(tzinfo=None)
+    assert len(store.context("bilinear", since=past.isoformat())) == 1
+    assert len(store.context("bilinear", since=future.isoformat())) == 0
+
+
+# --------------------------------------- §6.3 writes do not wait on the embedder
+
+
+def test_a_write_does_not_block_behind_a_query_side_embed():
+    """worker.py states the invariant that follows from priority 1: writes must
+    not block on embedding. It held on the write path -- embedding is off it
+    entirely -- and was defeated transitively, because `context` embedded inside
+    the store lock and `create_note` takes the same lock.
+
+    The bound that matters is QUERY_TIMEOUT (10s), not the 2s used here.
+    """
+    import threading
+    import time
+
+    class Slow:
+        model = "slow"
+        dim = 4
+
+        def __init__(self):
+            self.entered = threading.Event()
+
+        def embed(self, texts, timeout=0):
+            self.entered.set()
+            time.sleep(2.0)
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    embedder = Slow()
+    store = Store(":memory:", embedder=embedder)
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+    store.create_note("seed", "a seed note")
+    EmbeddingWorker(store).drain()
+
+    query = threading.Thread(target=lambda: store.context("seed"), daemon=True)
+    query.start()
+    assert embedder.entered.wait(5), "the embed never started"
+
+    started = time.monotonic()
+    store.create_note("write", "a write that must not wait")
+    elapsed = time.monotonic() - started
+    query.join(timeout=10)
+
+    assert elapsed < 0.5, f"write blocked {elapsed:.2f}s behind an in-flight embed"
