@@ -362,6 +362,22 @@ def main(argv: list[str] | None = None) -> int:
     return cli_main(argv)
 
 
+def _open_store(path, **kwargs) -> Store:
+    """Open the notes store, or say plainly why it cannot be opened.
+
+    Logged to stderr as well as raised: under stdio transport the client shows
+    the process's stderr, and an operator reading a client log needs the
+    recovery instructions there rather than in a traceback.
+    """
+    from .store import StoreVersionError
+
+    try:
+        return Store(path, **kwargs)
+    except StoreVersionError as exc:
+        log.error("cannot open %s: %s", path, exc)
+        raise
+
+
 def serve(
     db_path: Path | None = None,
     theta: float = DEFAULT_THETA,
@@ -372,7 +388,7 @@ def serve(
     path = db_path or default_db_path()
     snapshot_store = SnapshotStore(snapshot_path_for(path)) if snapshots else None
     embedder = OllamaEmbedder(model=model) if embeddings else None
-    store = Store(path, theta=theta, snapshots=snapshot_store, embedder=embedder)
+    store = _open_store(path, theta=theta, snapshots=snapshot_store, embedder=embedder)
 
     embed_worker = None
     if embedder is not None and store.vector_loaded:

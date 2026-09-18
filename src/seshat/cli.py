@@ -21,7 +21,7 @@ from .ids import looks_like_id
 from .review import DEFAULT_HOST, DEFAULT_PORT
 from .server import default_db_path, help_payload, serve
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
-from .store import DEFAULT_THETA, SeshatError, Store
+from .store import DEFAULT_THETA, SeshatError, Store, StoreVersionError
 from .worker import EmbeddingWorker
 
 
@@ -141,6 +141,25 @@ def _reset(path: Path, assume_yes: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Entry point. Turns a store this build cannot open into a message.
+
+    `StoreVersionError` carries recovery instructions -- which archive command
+    to run, and why there is no migration -- and those instructions are the
+    whole value of the check. Delivered as the last line of a stack trace they
+    read as a crash, and under `seshat serve` the MCP client sees the server
+    die rather than say what is wrong. Wrapping every path is deliberate: the
+    store is opened from four of them (`serve`, `review`, `token`, and the
+    shared tail below), and catching it at three would be a bug waiting for
+    the fourth.
+    """
+    try:
+        return _run(argv)
+    except StoreVersionError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+def _run(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     path = args.db or default_db_path()
 

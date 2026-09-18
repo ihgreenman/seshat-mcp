@@ -89,3 +89,27 @@ def test_the_schema_is_one_script_with_no_migration_chain():
 
     assert not hasattr(module, "MIGRATIONS")
     assert module.SCHEMA.count("CREATE TABLE note ") == 1
+
+
+def test_an_unopenable_store_reports_rather_than_crashing(tmp_path, capsys):
+    """The refusal's recovery instructions are the whole value of the check.
+    Delivered as the last line of a traceback they read as a crash -- and under
+    `seshat serve` the MCP client sees the server die instead of saying why.
+    """
+    import sqlite3
+
+    from seshat.cli import main
+
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA user_version = 3")
+    db.commit()
+    db.close()
+
+    for command in ("info", "check", "serve", "review"):
+        assert main(["--db", str(path), "--no-embeddings", command]) == 1
+        captured = capsys.readouterr()
+        assert "Traceback" not in captured.err
+        assert "error:" in captured.err
+        # The instructions have to survive, not just the failure.
+        assert "seshat reset" in captured.err, f"{command} lost the recovery advice"
