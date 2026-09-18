@@ -5,14 +5,20 @@ Distribution name `seshat-mcp`; CLI and MCP server identifier both `seshat`.
 Note that `seshat` is taken on crates.io (a Matrix event indexer), which
 matters only if the implementation goes to Rust.
 
-**Spec version: 1.3.** See §11 for versioning discipline and history.
+**Spec version: 1.4.** See §11 for versioning discipline and history.
 
-**Status:** implementation at increment 2 (software 0.2.0, store schema 3).
-1.3 adds capture-time evidence (§6.9) and the capture/analysis split
-(§6.10). All changes since 1.0 are additive or narrowing-of-claims. No signature
-removed. 1.3 adds two `snapshot` columns and a capability field, so it needs a
-schema bump on a table that is not yet populated — the cheapest migration the
-design will ever get, and a reason to take it now.
+**Status:** implementation at increment 2. No signature has been removed
+since 1.0; every revision has been additive or a narrowing of claims.
+
+- **1.4** adds a writing convention (§5.6), hardens the review interface's
+  bind rule (§10), and carries three findings from beta testing into §3.1,
+  §6.9 and §8. No schema change, no migration. Two implementation
+  consequences: reject unknown keys in `supersedes` entries, and carry
+  reference-style anchor text into `expectation`.
+- **1.3** adds two `snapshot` columns and a capability field. `snapshot` is
+  not yet populated, so this is the cheapest schema change the design will
+  ever get — take it before increment 4 fills the table, after which every
+  column is a real migration against data that cannot be regenerated.
 
 **Reading this document:** claims that have been measured cite the
 measurement. Claims that have not are reasoning, and say nothing. §6 is
@@ -104,6 +110,20 @@ Supersession is folded into creation deliberately: a separate second call
 is a call that gets forgotten, and the failure mode is a store holding two
 contradictory notes with no edge between them. Creation and its edges are
 atomic.
+
+**A `supersedes` entry is a closed schema. An unrecognised key is an error,
+not a value to skip.** This is priority 2 (§1) at the write path: a caller who
+misspells `why` and receives a success has been told their rationale was
+recorded when it was not, and the store now holds an edge whose reasoning is
+permanently missing with nothing anywhere marking the gap. Found in practice —
+a caller passed `rationale`, the column name from §6's schema sketch rather
+than the argument name, and the write succeeded silently.
+
+The general rule, which belongs in implementation notes rather than here:
+**ignoring an input is never a silent success.** Anywhere a caller-supplied
+structure is read field by field, the unread fields have to be an error.
+`supersedes` is currently the only such structure on the tool surface, which
+is why this is one rule rather than a sweep.
 
 Returns the new note's id.
 
@@ -474,6 +494,59 @@ machinery for an event that does not happen, and a hand-written `UPDATE`
 would have covered it. It is specified anyway because the schema cost is one
 table and a view, and history cannot be retrofitted onto data that has
 already been overwritten.
+
+### 5.6 Rationale prefix convention
+
+*Raised in beta testing. Convention only — no schema, no implementation
+change. It affects how rationales are written and what `note`'s tool
+description should say.*
+
+A single score conflates two different facts. `retained = 0.4` may mean
+**60% of this was wrong**, or it may mean **this holds only in the narrower
+case**. The first says the note was defective; the second says it was
+overgeneralised, and the content that survives is fully correct within its
+new bounds. Pool membership (§5.1) treats them identically, and the rationale
+text is the only place the difference can currently live.
+
+The convention: when a score records a *restriction* rather than a
+*degradation*, open the rationale with a `scope:` clause.
+
+```
+scope: holds for fixed-point implementations; the float path is unaffected
+wrong: the convergence bound was derived for the symmetric case only
+```
+
+Greppable without schema support, and a structured migration stays possible
+if the evidence warrants one. Cheap now, expensive to retrofit onto
+free-prose rationales later.
+
+**Keep the prefix set closed and small.** An open convention becomes
+unparseable within months — a writer will invent `narrowed:`, `partial:`,
+`context:` unless the vocabulary is enumerated somewhere actually read.
+Initial set, subject to what usage shows:
+
+| prefix | meaning |
+|---|---|
+| `scope:` | the old note is correct within stated bounds; the new one narrows it |
+| `wrong:` | the old note was mistaken in the part not retained |
+| `source:` | superseded by better evidence, not by better reasoning |
+
+Anything else stays free prose. Document the set in `note`'s and
+`supersedes`' tool descriptions, where a writer will see it; a convention
+documented only here will not be followed.
+
+**This is the same bet as §9.4, placed a second time.** That question defers
+a `kind` field on the grounds that convention-in-`desc` can approximate it.
+If `scope:` turns out to need structure, §9.4 and §9.1 probably resolve at
+the same moment and for the same reason. Move them together rather than
+letting one become a schema field while the others stay prose.
+
+The convention is safe to adopt early precisely because §5.5 already made
+assessments append-only. A rationale that classifies an edge as `scope:` and
+later proves to have been a genuine retraction gets a **new assessment** with
+new rationale, and the original prose survives. The convention records an
+interpretation, not a fact, and the design already assumed interpretations
+get revised.
 
 ---
 
@@ -909,9 +982,21 @@ expected of it**, because that is what makes the capture assessable.
 The expectation is already available and costs no new write-path argument:
 it is the **markdown anchor text** (§6.4, §6.5). `[texas population
 data](https://example.gov/population/tx)` states the expectation in the act of
-citing. Where the label is missing or degenerate ("here", "this article"), fall
-back to the note's `desc` and the surrounding sentence. `note`'s tool
-description should say that a good label now does double duty.
+citing. `note`'s tool description should say that a good label now does double
+duty.
+
+**Every CommonMark link form that carries anchor text must yield it**, not just
+the inline form. A reference-style link — `[rate limits][rl]` with its
+definition elsewhere — has anchor text that is every bit as much the author's
+statement of intent, and dropping it silently demotes that capture to the
+fallback path for no reason the author can see. Autolinks (`<https://…>`) and
+bare URLs genuinely have none, and the fallback is correct for those.
+
+Measured on the increment-2 implementation: all four forms extract their URL
+correctly, and the reference-style form returned `label: null`. Detection is
+sound; the label is being read off inline nodes only. Same defect class as
+§3.1's closed schema — a field present, unread, and its absence filled silently
+with something worse.
 
 **Copy the expectation into `snapshot`; do not read it from `link`.** `link` is
 derived and re-extractable, so a later revision could change the label and
@@ -941,6 +1026,25 @@ chunks of the extraction.
 > Like §7.2's suggested links, it is candidate generation for §10.2's review
 > queue, never a verdict. Automatic marking would produce false `thin` results
 > on exactly the reference pages most worth preserving.
+
+**When no anchor text exists, a null expectation beats a bad one.** The
+fallback — the note's `desc` plus the surrounding sentence — fails in a way the
+guard above does not cover. Observed output for a bare URL in a numbered list:
+the `desc` concatenated with a fragment that ran past the end of one list item
+and swallowed the numeral starting the next; another ended in a regex literal,
+which no page will ever satisfy. Sentence segmentation was treating a list as
+prose.
+
+The guard above stops a bad expectation from setting `status`. It does not stop
+it from generating a permanent, un-clearable candidate in §10.2's review queue,
+and a queue that cries wolf trains the reviewer to stop reading it — which is
+precisely the failure §7.2 anticipates for suggested links. Noise and false
+verdicts are different harms and need different guards.
+
+So: if the fallback cannot produce at least one content word the target could
+plausibly contain, store no expectation. A null expectation says *unknown*,
+which is true. A garbage one asserts something false and costs review attention
+forever. Low confidence on the exact test; high confidence on the direction.
 
 ### 6.10 Capture notes and analysis notes
 
@@ -1097,6 +1201,35 @@ succeeds. A store full of true-but-useless near-duplicate notes is where
 retrieval actually gets hard, and where §9.2 and §9.5 would become answerable.
 Both problems wait on the same accumulated data.
 
+**A first attempt exists and is confounded. Recorded here so it is not
+re-derived.** Beta testing grew a store from 7 notes to 12 by adding six
+notes from one domain, and reported that separating power collapsed from a
+0.13 cosine range to 0.059. The two numbers do not measure the same thing: at
+7 notes the retrieved set was one on-topic note against four off-topic ones,
+so the range was a *between-domain* distance; at 12 it was four on-topic
+against two off-topic, so the range was a *within-domain* distance. Between-
+domain distances exceed within-domain distances in any embedding that works.
+The experiment moved store size and candidate-set composition together and
+attributed the result to size.
+
+The control is cheap and already pre-registered: an earlier note recorded a
+query and its expected answer *before* the six were added. Re-running that one
+query against the grown store compares like with like. Gap holds and growth
+degraded nothing; gap collapses and the finding stands on evidence that bears
+on it.
+
+A competing hypothesis fits the same data: the embedding has a resolution
+floor for a given domain, reached as soon as more than one note occupies it,
+rather than a margin eroding progressively with size. Distinguishing test —
+add six more same-domain notes. Erosion predicts the spread keeps shrinking; a
+floor predicts it stays put.
+
+Two observations from that attempt survive its confound, being arithmetic
+rather than inference: fused rank and raw cosine disagreed on both queries in
+a way that would change which note a consumer picked, and at the domain
+boundary the lowest on-topic note sat 0.001 above the highest off-topic one —
+ordering preserved, margin gone.
+
 ---
 
 ## 9. Open questions
@@ -1111,9 +1244,11 @@ Both problems wait on the same accumulated data.
 
 3. **`I was wrong` vs `I said that badly`.** Both produce a supersession
    edge; they mean opposite things about the history of belief. Currently
-   distinguishable only by reading both notes, or by the narrow textual test
-   in §7.2, and by §5.5's assessment history. If it starts mattering — e.g. for asking the store where thinking
-   actually changed — the fix is one optional boolean, not a schema change.
+   distinguishable only by reading both notes, by the narrow textual test in
+   §7.2, and by §5.5's assessment history — now partly addressed by §5.6's
+   `wrong:` prefix, though only when the rationale was written at all, and it
+   is optional. If the distinction needs to be *queryable* rather than
+   readable, the fix is one optional boolean, not a schema change.
 
 4. **Optional `kind` field.** An earlier design had four kinds (finding,
    failure, thread, decision). Threads collapse into the supersession model
@@ -1124,7 +1259,9 @@ Both problems wait on the same accumulated data.
    The strongest argument for eventually adding it: a `check_failures(topic)`
    call made *before* proposing an approach is defensive retrieval, and it is
    plausibly the highest-value query in the system. It can be approximated by
-   convention in `desc` first.
+   convention in `desc` first — and if §5.6's prefixes prove they need
+   structure, this question and §9.1 should be resolved in the same revision
+   rather than one at a time.
 
 5. **Similarity threshold for suggested links.** Unknown, and unanswerable
    from current data — it needs the near-duplicate regime (§8), which no
@@ -1152,9 +1289,28 @@ A local web UI, served by a subcommand of the same binary. Not an MCP tool
 surface — it adds nothing to §3 — and not part of the first three increments
 (§11.3). Increment 4.
 
-**Localhost only.** Binds 127.0.0.1, no authentication, no remote access.
-Making it network-reachable is out of scope (§12); it would demand an auth
-model this tool has no business owning.
+**Localhost only, and not overridable.** Binds a loopback address — 127.0.0.1
+by default — with no authentication of any kind; only §10.2's extension API
+holds a token. The bind address is therefore the entire access-control story
+for the reader, which is why there is no flag, argument or environment variable
+that widens it. A switch that did would put a personal note store one typo, one
+copied command line or one inherited environment away from an open one, and the
+whole interface would then be carrying a security property that nobody can see
+in the command they typed.
+
+Loopback is determined by resolution rather than by matching literals:
+`localhost` is loopback by convention and `127.0.0.2` by arithmetic, while a
+name that looks local can resolve off-box. IPv4-mapped IPv6 forms such as
+`::ffff:127.0.0.1` are the usual way a literal-matching check goes wrong in
+both directions, which is the argument for resolving rather than comparing
+strings. An address whose reach cannot be established resolves to *remote* and
+is refused, because the failure that matters is publishing by accident.
+
+Access from another machine is a reverse proxy's job. A proxy can terminate TLS
+and authenticate; this interface can do neither, and making it network-reachable
+would demand an auth model this tool has no business owning (§12). Refusing
+outright keeps that boundary somewhere it can be reasoned about, rather than
+inside a flag.
 
 ### 10.1 Primary function: reading the store
 
@@ -1323,6 +1479,24 @@ Not part of the contract, but the versions above only make sense against it.
   to the snapshot histogram and `extraction` to the capability set, closing
   the `thin: 0` false zero. §10.2 expanded for the extension; build order
   reordered to put snapshots ahead of the review interface.
+- **1.4** — first revision fed by beta testing rather than by the authors.
+  - §5.6, a closed-set prefix convention for assessment rationales (`scope:` /
+    `wrong:` / `source:`), distinguishing a scoped supersession from a degraded
+    one without adding schema. §9.3 and §9.4 note that §5.6, §9.1 and §9.4
+    should resolve together if any of them needs structure.
+  - §10's bind rule made explicit and non-overridable: loopback by resolution
+    rather than by literal match, unreachable resolves to remote and is
+    refused, off-box access is a reverse proxy's job. §12 updated to match.
+  - §3.1: `supersedes` entries are a closed schema and an unrecognised key is
+    an error. From a defect where a misspelled argument name produced a silent
+    success.
+  - §6.9: anchor text must be carried from every CommonMark link form that has
+    it, not only the inline form; and where none exists, a null expectation
+    beats a fabricated one, because a bad expectation is review-queue noise
+    that the never-auto-set-`status` guard does not catch.
+  - §8: the first near-duplicate measurement recorded together with the
+    confound that invalidates its inference, the pre-registered control that
+    would settle it, and the two observations that survive regardless.
 
 ---
 
@@ -1333,7 +1507,9 @@ Not part of the contract, but the versions above only make sense against it.
   storing, or searching the artifacts themselves is a separate system that
   may never be needed.
 - Multi-user access, auth, remote transport. Local stdio, single user. The
-  review interface (§10) is localhost-only for the same reason.
+  review interface (§10) is localhost-only for the same reason, with no
+  override: anything off-box goes behind a reverse proxy that owns the auth
+  this tool deliberately does not.
 - Credential storage of any kind. §10.2 resolves authenticated targets by
   accepting content, never secrets.
 - Automatic note extraction from conversation. Writes are explicit.
