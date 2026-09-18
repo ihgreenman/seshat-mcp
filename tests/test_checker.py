@@ -433,10 +433,10 @@ class _FixedEmbedder:
     closed form before any code under test runs."""
 
     model = "fixed"
-    dim = 4
 
     def __init__(self, vectors):
         self.vectors = vectors
+        self.dim = len(vectors[0])
         self.seen = 0
 
     def embed(self, texts, timeout=0):
@@ -528,3 +528,99 @@ def test_a_zero_vector_is_excluded_rather_than_divided_by(tmp_path):
         assert checker.check_suggested_links() == []
     finally:
         checker.close()
+
+
+# ------------------------------------------- §7.2 the comparison has a budget
+
+
+def _embedded(tmp_path, count):
+    """A store with `count` embedded notes and no supersession between them."""
+    import random
+
+    from seshat.worker import EmbeddingWorker
+
+    random.seed(11)
+    vectors = [[random.gauss(0, 1) for _ in range(8)] for _ in range(count)]
+    path = tmp_path / "n.db"
+    store = Store(path, embedder=_FixedEmbedder(vectors))
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+    for index in range(count):
+        store.create_note(f"note {index}", f"body of note {index}")
+    EmbeddingWorker(store).drain()
+    store.db.commit()
+    store.close()
+    return path
+
+
+def test_over_budget_the_check_says_so_rather_than_going_quiet(tmp_path):
+    """The report is read as "what is wrong with the store", so an absent
+    section reads as "nothing wrong". A reader who sees no suggested links must
+    not be able to conclude there are none when nothing looked."""
+    path = _embedded(tmp_path, 12)  # 66 pairs
+    checker = Checker(str(path), similarity=-1.0, pair_budget=10)
+    try:
+        findings = checker.check_suggested_links()
+    finally:
+        checker.close()
+
+    assert len(findings) == 1
+    assert findings[0].check == "suggested links not run"
+    assert findings[0].detail["pairs"] == 66
+    assert "not the same as none existing" in findings[0].message
+    assert "seshat check" in findings[0].message
+
+
+def test_under_budget_the_check_runs_normally(tmp_path):
+    """The budget must not reach past the case it exists for."""
+    path = _embedded(tmp_path, 12)
+    checker = Checker(str(path), similarity=-1.0, pair_budget=10_000)
+    try:
+        findings = checker.check_suggested_links()
+    finally:
+        checker.close()
+    assert all(f.check == "suggested link" for f in findings)
+    assert len(findings) > 1
+
+
+def test_no_budget_means_no_limit(tmp_path):
+    """`seshat check` is a batch command somebody ran on purpose, and should
+    take as long as the store needs."""
+    path = _embedded(tmp_path, 12)
+    checker = Checker(str(path), similarity=-1.0, pair_budget=None)
+    try:
+        findings = checker.check_suggested_links()
+    finally:
+        checker.close()
+    assert all(f.check == "suggested link" for f in findings)
+
+
+def test_the_budget_survives_into_the_full_report(tmp_path):
+    """Reported through `run()` and rendered, not just returned from the one
+    method -- that is where a reader actually meets it."""
+    from seshat.checker import format_report
+
+    path = _embedded(tmp_path, 12)
+    checker = Checker(str(path), similarity=-1.0, pair_budget=10)
+    try:
+        findings = checker.run(semantic=True)
+    finally:
+        checker.close()
+    assert any(f.check == "suggested links not run" for f in findings)
+    assert "suggested links not run" in format_report(findings, {}, 12)
+
+
+def test_the_review_interface_sets_a_budget_and_the_cli_does_not():
+    """The budget is a property of the caller, not of the check: one runs on the
+    end of an HTTP request with no timeout, the other does not."""
+    import inspect
+
+    from seshat.checker import DEFAULT_PAIR_BUDGET
+    from seshat.cli import _parser
+    from seshat.review import REVIEW_PAIR_BUDGET, render_check
+
+    assert isinstance(REVIEW_PAIR_BUDGET, int) and REVIEW_PAIR_BUDGET > 0
+    assert "pair_budget=REVIEW_PAIR_BUDGET" in inspect.getsource(render_check)
+    # Unlimited unless asked: 0 from the CLI means "no cap".
+    assert DEFAULT_PAIR_BUDGET is None
+    assert _parser().parse_args(["check"]).pair_budget == 0

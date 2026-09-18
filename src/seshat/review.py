@@ -437,11 +437,22 @@ afterwards — it cannot be regenerated from anything.</p>
 {body or '<p class="dim">Nothing to triage.</p>'}"""
 
 
+REVIEW_PAIR_BUDGET = 60_000
+"""Pair budget for §7.2's comparison when it runs on the end of an HTTP request.
+
+~60k pairs is about 350 embedded notes, a bit over a second. The check is
+quadratic, so at 1000 notes it is ~9s and at 5000 ~4 minutes -- and this handler
+has no timeout, so the browser gives up long before the thread does. The budget
+is here rather than in the checker because it is a property of THIS CALLER: a
+batch command somebody ran on purpose should take as long as it takes."""
+
+
 def render_check(review: Review) -> str:
     checker = Checker(
         str(review.db_path),
         snapshot_path_for(review.db_path) if review.snapshots else None,
         theta=review.store.theta,
+        pair_budget=REVIEW_PAIR_BUDGET,
     )
     try:
         findings = checker.run(semantic=True)

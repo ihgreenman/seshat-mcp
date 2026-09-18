@@ -17,9 +17,10 @@ python3 -m venv .venv
 ollama pull nomic-embed-text        # optional; enables semantic search
 ```
 
-Python ≥ 3.11. Two required dependencies (`mcp`, `pydantic`); everything else is
-stdlib. `sqlite-vec` and Ollama are both optional at runtime — without them
-retrieval falls back to keyword search and `help` says so.
+Python ≥ 3.13, matching current Debian stable. Two required dependencies
+(`mcp`, `pydantic`); everything else is stdlib. `sqlite-vec` and Ollama are
+both optional at runtime — without them retrieval falls back to keyword search
+and `help` says so.
 
 ## Use it from Claude Code
 

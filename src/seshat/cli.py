@@ -86,6 +86,11 @@ def _parser() -> argparse.ArgumentParser:
                    help="cosine threshold for suggested links (§7.2, open question §9.5)")
     k.add_argument("--fail-on", default="none", choices=["none", "error", "warning", "review"],
                    help="exit non-zero when findings at this severity or worse exist")
+    k.add_argument("--pair-budget", type=int, default=0,
+                   help="cap the pairs §7.2's similarity comparison will examine "
+                        "(0 = no cap, the default). The comparison is quadratic: "
+                        "roughly 9s at 1000 notes and 4 minutes at 5000. Over the cap "
+                        "the check is declined and says so in the report.")
 
     f = sub.add_parser("fetch", help="drain the snapshot capture queue now")
     f.add_argument("--limit", type=int, default=0, help="0 means drain everything")
@@ -269,6 +274,7 @@ def _run(argv: list[str] | None = None) -> int:
             checker = Checker(
                 str(path), snapshot_path_for(path) if args.snapshots else None,
                 theta=args.theta, similarity=args.similarity,
+                pair_budget=args.pair_budget or None,
             )
             try:
                 findings = checker.run(semantic=args.semantic)

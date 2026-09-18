@@ -15,6 +15,7 @@ periodically be read in full, and this says where to start.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -36,6 +37,18 @@ Model-keyed, not universal: nomic-embed-text cosines occupy a compressed band,
 so a value tuned against one model does not transfer to another, and a re-embed
 under a different model invalidates whatever experience suggested it. It is at
 least a cosine -- `Checker._vectors` normalises so that it is."""
+
+DEFAULT_PAIR_BUDGET: int | None = None
+"""Pairs `check_suggested_links` will compare before declining. None = no limit.
+
+The check is exactly quadratic -- n(n-1)/2 pairs of 768 floats -- at a measured
+~18us per pair, so 1000 notes is ~9 seconds and 5000 is ~4 minutes. That is
+fine for a batch command somebody ran on purpose and not fine on the end of an
+HTTP request, which is why the budget is a parameter rather than a constant:
+`seshat check` leaves it unlimited, the review interface sets one.
+
+Declining is REPORTED, never silent. A reader who sees no suggested links must
+not conclude there are none."""
 
 NEAR_IDENTICAL = 0.98
 """Text similarity above which a `desc` change is classified as a description
@@ -78,10 +91,12 @@ class Checker:
         snapshot_path: str | None = None,
         theta: float = DEFAULT_THETA,
         similarity: float = DEFAULT_SIMILARITY,
+        pair_budget: int | None = DEFAULT_PAIR_BUDGET,
     ):
         self.db = _read_only(db_path)
         self.theta = theta
         self.similarity = similarity
+        self.pair_budget = pair_budget
         self.snapshots: sqlite3.Connection | None = None
         if snapshot_path:
             try:
@@ -416,6 +431,22 @@ class Checker:
         vectors = self._vectors()
         if len(vectors) < 2:
             return []
+
+        pairs = len(vectors) * (len(vectors) - 1) // 2
+        if self.pair_budget is not None and pairs > self.pair_budget:
+            # Reported, not skipped quietly. The whole report is read as "what
+            # is wrong with the store", and an absent section reads as "nothing".
+            return [Finding(
+                "suggested links not run", "info",
+                f"{len(vectors)} embedded notes is {pairs} pairs, over the "
+                f"{self.pair_budget}-pair budget for this caller -- the comparison is "
+                f"quadratic and would take roughly {pairs * 1.8e-5:.0f}s. NO suggested "
+                f"links were looked for, which is not the same as none existing. "
+                f"Run `seshat check` from the command line, which has no budget.",
+                (),
+                {"notes": len(vectors), "pairs": pairs, "budget": self.pair_budget},
+            )]
+
         reach = self._reachable()
         ids = sorted(vectors)
         descs = self._descs()
@@ -425,8 +456,12 @@ class Checker:
             for b in ids[i + 1 :]:
                 if b in reach.get(a, ()) or a in reach.get(b, ()):
                     continue
-                # A cosine, because `_vectors` normalised both sides.
-                score = sum(x * y for x, y in zip(va, vectors[b]))
+                # A cosine, because `_vectors` normalised both sides. `sumprod`
+                # rather than a generator expression: same arithmetic, done in
+                # C, measured 3.8x faster at 768 dimensions (68.4us -> 18.1us
+                # per pair). It does not change the asymptotics, and nothing
+                # here should pretend it does.
+                score = math.sumprod(va, vectors[b])
                 if score >= self.similarity:
                     findings.append(Finding(
                         "suggested link", "info",

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "seshat-mcp"
 version = "0.3.0"
 description = "A persistent note store an LLM assistant can query and write cheaply"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "Ian Greenhoe" }]
 dependencies = ["mcp>=2.0", "pydantic>=2.0"]

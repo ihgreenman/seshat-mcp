@@ -165,6 +165,28 @@ Three things are enforced rather than intended:
   header, which is disproportionate here. And **this is not in the spec yet** —
   §6.6 describes capture-at-write without saying what may be fetched. It should
   say so in 1.5.
+- **§7.2's comparison is quadratic, and the budget for it belongs to the
+  caller.** n(n-1)/2 pairs of 768 floats, measured at ~18us per pair: 0.3s at
+  400 notes, ~9s at 1000, ~4 minutes at 5000. `seshat check` runs it unlimited
+  because somebody asked for it; the review interface caps it at 60k pairs
+  (~350 notes) because that handler has no timeout and the browser gives up
+  long before the thread does. Over budget the check is **declined in the
+  report**, never skipped quietly -- a reader who sees no suggested links must
+  not be able to conclude there are none when nothing looked.
+
+  Three things measured rather than assumed, two of which were wrong. A SQL
+  self-join over `vec_distance_cosine` is *slower* than the Python loop (6.4s
+  vs 5.4s at 400 notes) -- virtual-table row overhead swamps the C arithmetic.
+  `array('d')` is slower than a plain list for `math.sumprod`, because it
+  unboxes on access. What did work was `math.sumprod` itself: identical
+  arithmetic in C, 3.8x (68.4us -> 18.1us per pair), and it changes no answer --
+  swapping it back for the generator expression leaves every test green.
+
+  The asymptotics are untouched. sqlite-vec's KNN would remove them (~16s at
+  5000 notes, and flat per-note across the measured range) but changes the
+  check from "every pair above the threshold" to "the k nearest per note", so a
+  note with more than k genuine neighbours would have some silently omitted.
+  Not taken; recorded here so it need not be re-derived.
 - **POSTs are origin-checked and token-guarded.** "localhost is safe" stops
   being true the moment a browser is a client — any page you visit can post to
   127.0.0.1. §10.2 names this for the extension; it applies the instant a
