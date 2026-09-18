@@ -176,8 +176,10 @@ Three things are enforced rather than intended:
   not be able to conclude there are none when nothing looked.
 
   Three things measured rather than assumed, two of which were wrong. A SQL
-  self-join over `vec_distance_cosine` is *slower* than the Python loop (6.4s
-  vs 5.4s at 400 notes) -- virtual-table row overhead swamps the C arithmetic.
+  self-join over `vec_distance_cosine` is not merely slower than the Python
+  loop, it is dramatically worse as the store grows -- 6.0s against 5.1s at 400
+  notes, but 344s against 21s at 800 and 2709s against 82s at 1600. Whatever
+  vec0 does per row on a self-join, it is not linear in the rows.
   `array('d')` is slower than a plain list for `math.sumprod`, because it
   unboxes on access. What did work was `math.sumprod` itself: identical
   arithmetic in C, 3.8x (68.4us -> 18.1us per pair), and it changes no answer --

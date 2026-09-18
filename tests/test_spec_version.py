@@ -47,3 +47,59 @@ def test_skew_is_reported_not_hidden(doc_version):
             f"-- features from the newer revision are not built yet"
         )
     assert SPEC_VERSION == doc_version
+
+
+def test_the_extension_tracks_the_package_version():
+    """The extension ships alongside the server and speaks its API, so the two
+    versions track. Nothing enforced that -- they were hand-edited in separate
+    files and had already drifted to 0.1.0 against 0.3.0, which is how the
+    USER_AGENT came to claim 0.1 as well.
+
+    Pinned rather than derived: a manifest cannot import Python, so the only
+    options are a check here or a build step, and a check is cheaper.
+    """
+    import json
+    from pathlib import Path
+
+    from seshat import __version__
+
+    manifest = json.loads(
+        (Path(__file__).resolve().parent.parent / "extension" / "manifest.json").read_text()
+    )
+    assert manifest["version"] == __version__, (
+        f"extension is {manifest['version']}, package is {__version__}"
+    )
+
+
+def test_the_project_url_is_stated_once_and_agrees_everywhere():
+    """Three places name it -- the packaging metadata, the extension manifest,
+    and the User-Agent every capture sends. A placeholder in the last of those
+    is what the review found, so they are checked against each other."""
+    import json
+    from pathlib import Path
+
+    from seshat.snapshots import PROJECT_URL
+
+    root = Path(__file__).resolve().parent.parent
+    assert PROJECT_URL in (root / "pyproject.toml").read_text()
+    manifest = json.loads((root / "extension" / "manifest.json").read_text())
+    assert manifest["homepage_url"] == PROJECT_URL
+
+
+def test_the_readme_states_the_implemented_spec_revision():
+    """The README is the landing page, so its version claim is the first thing
+    a reader trusts -- and it had drifted to 1.3 while the code moved to 1.4.
+
+    Checked against SPEC_VERSION rather than against the document, so it tracks
+    what is BUILT rather than what is written: a spec revision landing before
+    the code is normal, and the README should follow the code.
+    """
+    import re
+    from pathlib import Path
+
+    readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
+    stated = re.search(r"Built against spec ([0-9]+(?:\.[0-9]+)*)", readme)
+    assert stated, "the README must say which spec revision this build implements"
+    assert stated.group(1) == SPEC_VERSION, (
+        f"README says spec {stated.group(1)}, code implements {SPEC_VERSION}"
+    )

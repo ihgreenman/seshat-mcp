@@ -254,13 +254,22 @@ def refuse_target(url: str) -> str | None:
     private page preserved can paste it (§10.2); that path was already built,
     already requires a human, and never puts seshat on the private network.
 
-    **What this does not stop:** the name is resolved here and again by the
-    connection, so a DNS answer that changes between the two is not caught.
-    Closing that needs connecting to a pinned address with an explicit Host
-    header and certificate check, which is disproportionate here -- the attacker
-    would need to control DNS for a name a note already cites. Recorded rather
-    than implied, because a guard nobody knows the limits of gets trusted past
-    them.
+    **What this does not stop.** Recorded rather than implied, because a guard
+    nobody knows the limits of gets trusted past them.
+
+    The name is resolved here and again by the connection, so a DNS answer that
+    changes between the two is not caught. Closing that needs connecting to a
+    pinned address with an explicit Host header and certificate check, which is
+    disproportionate here -- the attacker would need to control DNS for a name
+    a note already cites.
+
+    And on a NAT64 network using a CUSTOM prefix, a *hostname* resolving to a
+    private IPv4 comes back as a synthesised IPv6 address this cannot decode.
+    Literals are handled exactly, and RFC 6052's well-known 64:ff9b::/96 needs
+    no special case because Python already reports it as reserved -- but an
+    arbitrary provider prefix is indistinguishable from an ordinary IPv6
+    address without knowing it. Reading the prefix out of the system resolver
+    would be the fix if this ever matters.
     """
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme.lower() not in ("http", "https"):
@@ -268,6 +277,18 @@ def refuse_target(url: str) -> str | None:
     host = parsed.hostname
     if not host:
         return "no host in the URL"
+
+    # An address literal is classified as written, never resolved. On a
+    # NAT64/DNS64 network `getaddrinfo` SYNTHESISES an IPv6 answer for an IPv4
+    # literal -- 192.168.1.1 came back as 2607:7700:0:31::c0a8:101 -- and that
+    # synthesised address matches no private range, so resolving a literal
+    # turned a refusal into an allow. There is nothing a lookup can tell us
+    # about a literal that the literal does not already say.
+    try:
+        return _address_objection(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+
     try:
         infos = socket.getaddrinfo(host, parsed.port or 0, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:

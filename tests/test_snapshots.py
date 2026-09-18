@@ -895,3 +895,32 @@ def test_the_user_agent_states_the_real_version_and_project():
     assert f"seshat/{__version__}" in USER_AGENT
     assert PROJECT_URL in USER_AGENT
     assert PROJECT_URL.startswith("https://") and PROJECT_URL.count("/") > 2
+
+
+def test_an_address_literal_is_classified_without_being_resolved():
+    """Found as an intermittent test failure that was a real bypass.
+
+    On a NAT64/DNS64 network the resolver synthesises an IPv6 answer for an
+    IPv4 literal -- `getaddrinfo("192.168.1.1")` returned
+    `2607:7700:0:31::c0a8:101`, with `c0a8:101` being the address itself -- and
+    that synthesised form matches no private range, so resolving a literal
+    turned a refusal into an allow. A literal says everything a lookup could.
+    """
+    import socket
+
+    from seshat.snapshots import refuse_target
+
+    def synthesised(host, port, *args, **kwargs):
+        # What a NAT64 resolver does to an IPv4 literal.
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "",
+                 ("2607:7700:0:31::c0a8:101", port or 0, 0, 0))]
+
+    import unittest.mock
+
+    with unittest.mock.patch.object(socket, "getaddrinfo", synthesised):
+        assert refuse_target("http://192.168.1.1/admin") is not None
+        assert refuse_target("http://10.0.0.5/") is not None
+        assert refuse_target("http://127.0.0.1/") is not None
+        # A hostname still goes through the resolver, and the synthesised answer
+        # is all there is to judge -- the documented residual limit.
+        assert refuse_target("https://example.com/") is None

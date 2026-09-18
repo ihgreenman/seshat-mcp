@@ -7,7 +7,7 @@ The unit is a note, not a file. Notes are **append-only**: there is no update an
 no delete, and every correction is a new note that supersedes an old one, which
 means the history of what you believed and when is preserved by construction.
 
-Built against spec 1.3 — [`docs/seshat-mcp-spec.md`](docs/seshat-mcp-spec.md).
+Built against spec 1.4 — [`docs/seshat-mcp-spec.md`](docs/seshat-mcp-spec.md).
 
 ## Install
 
@@ -123,7 +123,7 @@ background fetch gets a paywall and your browser doesn't. See
 .venv/bin/python -m pytest
 ```
 
-277 tests, no network access: the embedder and the fetcher are both injected.
+391 tests, no network access: the embedder and the fetcher are both injected.
 Expected values are derived independently of the implementation
 (`tests/reference.py` re-derives the load-bearing rules from the spec text and
 imports nothing from `seshat`), and the assertions that matter have been checked
