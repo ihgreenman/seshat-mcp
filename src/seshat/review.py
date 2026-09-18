@@ -13,8 +13,14 @@ Three structural decisions, each enforced rather than intended:
   someone reasonable. A connection that physically cannot write is not an
   affordance anyone can relax by accident. Snapshot repair goes through a
   separate, writable connection to a separate file.
-* **127.0.0.1 only** (§10, §12). No authentication, no remote access; making it
-  network-reachable would demand an auth model this tool has no business owning.
+* **Loopback only, with no override** (§10, §12). The reader has no
+  authentication of any kind -- only the extension API carries a token -- so the
+  bind address is the entire access-control story. `--host` chooses among
+  loopback addresses and nothing more: a non-loopback one is refused before a
+  socket exists, and no flag or environment variable relaxes that. Off-box
+  access belongs to a reverse proxy, which can authenticate and terminate TLS;
+  this interface cannot, and giving it a switch that pretends otherwise would
+  put a personal note store one typo away from an open one.
 * **Origin-checked, token-guarded POSTs.** The moment a browser can reach an
   interface, "localhost is safe" stops being true: any page you visit can post
   to it. §10.2 names this for the extension, and it applies the instant a POST
@@ -26,9 +32,11 @@ Stdlib only, server-rendered, no JavaScript and no external assets.
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import logging
 import secrets
+import socket
 import threading
 import urllib.parse
 from dataclasses import asdict
@@ -708,24 +716,122 @@ class Handler(BaseHTTPRequestHandler):
         self._redirect("/triage")
 
 
+DEFAULT_HOST = "127.0.0.1"
+"""Loopback, because the reader has no authentication and the typical user is
+one person on one machine. Widening it is a deliberate act -- see `is_loopback`."""
+
+DEFAULT_PORT = 8765
+
+
+class RemoteBindRefused(ValueError):
+    """A bind address was requested that reaches beyond this machine.
+
+    There is no flag, argument or environment variable that turns this into a
+    permitted bind -- see `check_bind`. A ValueError because that is what it
+    is: an argument whose value is not acceptable.
+    """
+
+
+def resolve_addresses(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Every address `host` would actually bind. Empty when it resolves to nothing.
+
+    Resolution rather than pattern matching: `localhost` is loopback by
+    convention, `127.0.0.2` by arithmetic, and a name that happens to look
+    local can resolve off-box. Matching strings would get all three wrong in
+    different directions.
+    """
+    if not host:
+        return []  # "" is every interface, exactly like 0.0.0.0
+    try:
+        return [ipaddress.ip_address(host.strip("[]"))]
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+    return [ipaddress.ip_address(info[4][0]) for info in infos]
+
+
+def is_loopback(host: str) -> bool:
+    """Does this bind address reach only this machine?
+
+    False for anything unresolvable, and for the wildcards -- `0.0.0.0`, `::`
+    and `""` all include every interface the machine has. The default is
+    refusal: an address whose reach cannot be established is treated as remote,
+    because the failure that matters is publishing the store by accident.
+    """
+    addresses = resolve_addresses(host)
+    return bool(addresses) and all(address.is_loopback for address in addresses)
+
+
+def address_family(host: str) -> int:
+    """AF_INET6 when the bind address is v6.
+
+    `ThreadingHTTPServer` is AF_INET, so binding `::1` against the default
+    raises -- which is why the old localhost-only whitelist accepted an address
+    it could never actually serve.
+    """
+    addresses = resolve_addresses(host)
+    if host == "::" or (addresses and all(a.version == 6 for a in addresses)):
+        return socket.AF_INET6
+    return socket.AF_INET
+
+
+def display_url(host: str, port: int) -> str:
+    """A URL that can be pasted. v6 literals need brackets."""
+    shown = f"[{host}]" if ":" in host else host
+    return f"http://{shown}:{port}"
+
+
+def check_bind(host: str, port: int) -> None:
+    """Refuse any bind address that reaches beyond this machine (§10, §12).
+
+    **This takes no override parameter, and that is the design.** The reader
+    has no authentication of any kind -- only §10.2's extension API holds a
+    token -- so a non-loopback bind publishes every note to whoever can reach
+    the port. A flag permitting it would be a one-word distance between a
+    personal note store and an open one, reachable by a typo, a copied command
+    line or an inherited environment variable. Off-box access is a reverse
+    proxy's job: it can terminate TLS and authenticate, which this interface
+    cannot and should not learn to do.
+
+    Separated from serving so the policy can be tested without a socket: a gate
+    whose only test path binds a port fails by *hanging* when the gate is
+    removed, which is the one failure mode a safety check must not have.
+    """
+    if not is_loopback(host):
+        raise RemoteBindRefused(
+            f"refusing to bind {host or '0.0.0.0'}: the review interface has no "
+            f"authentication, so this would publish every note to anyone who can "
+            f"reach {host or '0.0.0.0'}:{port}. This is not overridable -- bind a "
+            f"loopback address ({DEFAULT_HOST}, ::1) and put a reverse proxy in "
+            f"front if you need access from elsewhere."
+        )
+
+
 def serve_review(
     db_path: Path,
-    port: int = 8765,
-    host: str = "127.0.0.1",
+    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_HOST,
     snapshots: bool = True,
     capture_api: bool = True,
     embeddings: bool = True,
     model: str = DEFAULT_MODEL,
 ) -> None:
+    """Serve the review interface. Loopback only, with no way to widen it.
+
+    `host` chooses *among* loopback addresses -- 127.0.0.1, ::1, or another
+    127/8 address -- and anything else is refused before a socket exists. There
+    is deliberately no parameter here that permits a wider bind; see
+    `check_bind` for why, and §10 for the spec's statement of it.
+    """
+    check_bind(host, port)
+
     embedder = OllamaEmbedder(model=model) if embeddings else None
     review = Review(
         db_path, snapshots=snapshots, capture_api=capture_api, embedder=embedder
     )
-    if host not in ("127.0.0.1", "localhost", "::1"):
-        # §10/§12: remote transport is out of scope, and binding wider would
-        # demand an auth model this tool has no business owning.
-        raise ValueError(f"refusing to bind {host}: the review interface is localhost-only")
-
     # An extension capture writes a note here, not in the MCP server, so this
     # process needs its own drain -- otherwise captures sit unembedded until
     # something else happens to run.
@@ -737,8 +843,11 @@ def serve_review(
         log.info("embedder: %s (%d to embed)", model, review.writer.embedding_backlog())
 
     handler = type("BoundHandler", (Handler,), {"review": review})
-    httpd = ThreadingHTTPServer((host, port), handler)
-    log.info("review interface: http://%s:%d (notes read-only)", host, port)
+    server = type(
+        "BoundServer", (ThreadingHTTPServer,), {"address_family": address_family(host)}
+    )
+    httpd = server((host, port), handler)
+    log.info("review interface: %s (notes read-only)", display_url(host, port))
     if review.api_token:
         log.info("extension API enabled; token in %s", token_path(review.db_path))
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)

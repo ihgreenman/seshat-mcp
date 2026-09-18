@@ -18,6 +18,7 @@ from pathlib import Path
 from .checker import DEFAULT_SIMILARITY, SEVERITIES, Checker, format_report
 from .embeddings import DEFAULT_MODEL, EmbedderUnavailable, OllamaEmbedder
 from .ids import looks_like_id
+from .review import DEFAULT_HOST, DEFAULT_PORT
 from .server import default_db_path, help_payload, serve
 from .snapshots import SnapshotStore, SnapshotWorker, snapshot_path_for
 from .store import DEFAULT_THETA, SeshatError, Store
@@ -62,8 +63,13 @@ def _parser() -> argparse.ArgumentParser:
     ps.add_argument("--file", type=Path, default=None, help="read text from a file (default: stdin)")
 
     rv = sub.add_parser("review", help="local web interface for reading the store (§10)")
-    rv.add_argument("--port", type=int, default=8765)
-    rv.add_argument("--host", default="127.0.0.1", help="localhost only; §10 forbids more")
+    rv.add_argument("--port", type=int, default=int(os.environ.get("SESHAT_PORT") or DEFAULT_PORT))
+    rv.add_argument(
+        "--host", default=os.environ.get("SESHAT_HOST") or DEFAULT_HOST,
+        help=f"loopback address to bind (default: {DEFAULT_HOST}; ::1 for IPv6). "
+             f"Off-box addresses are refused and there is no flag to allow them "
+             f"-- put a reverse proxy in front instead.",
+    )
     rv.add_argument("--no-capture-api", dest="capture_api", action="store_false",
                     help="serve the UI only; refuse the browser extension's endpoints")
 
@@ -139,11 +145,19 @@ def main(argv: list[str] | None = None) -> int:
     path = args.db or default_db_path()
 
     if args.command == "review":
-        from .review import serve_review
+        from .review import RemoteBindRefused, serve_review
 
-        serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots,
-                     capture_api=args.capture_api, embeddings=args.embeddings,
-                     model=args.model)
+        try:
+            serve_review(path, port=args.port, host=args.host, snapshots=args.snapshots,
+                         capture_api=args.capture_api, embeddings=args.embeddings,
+                         model=args.model)
+        except RemoteBindRefused as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            # A bad interface or a taken port; the message names which.
+            print(f"error: cannot bind {args.host}:{args.port}: {exc}", file=sys.stderr)
+            return 1
         return 0
 
     if args.command == "token":

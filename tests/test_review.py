@@ -292,11 +292,175 @@ def test_a_same_origin_post_is_accepted(server):
 
 
 def test_binding_beyond_localhost_is_refused(tmp_path):
-    """§10/§12: remote transport is out of scope, and binding wider would demand
-    an auth model this tool has no business owning."""
+    """§10/§12: the reader has no authentication, so the bind address is the
+    whole access-control story and off-box is simply not available."""
+    from seshat.review import check_bind
+
+    with pytest.raises(ValueError, match="no authentication"):
+        check_bind("0.0.0.0", 8765)
+
+    # And through the real entry point, which must not reach a bind either.
     Store(tmp_path / "n.db").close()
-    with pytest.raises(ValueError, match="localhost-only"):
+    with pytest.raises(ValueError, match="not overridable"):
         serve_review(tmp_path / "n.db", host="0.0.0.0", snapshots=False)
+
+
+def test_no_argument_anywhere_permits_an_off_box_bind():
+    """The requirement in its strongest form: off-box is refused *regardless of
+    command line switches*. Encoded against the parser rather than against a
+    list of flags written out by hand, so a future flag is covered the day it
+    is added rather than the day someone remembers to extend this test.
+    """
+    import itertools
+
+    from seshat.cli import _parser
+    from seshat.review import check_bind, serve_review
+
+    def switches(parser):
+        """Valueless optionals -- the ones that can be passed on their own."""
+        return [
+            action.option_strings[0]
+            for action in parser._actions
+            if action.option_strings
+            and action.nargs == 0
+            and action.option_strings[0] not in ("-h", "--help")
+        ]
+
+    top = _parser()
+    review = top._subparsers._group_actions[0].choices["review"]
+    # Global switches precede the subcommand, subcommand switches follow it.
+    globals_, locals_ = switches(top), switches(review)
+    assert globals_ and locals_, "enumeration found nothing; this test would be vacuous"
+
+    flags = [(f, True) for f in globals_] + [(f, False) for f in locals_]
+    for size in range(len(flags) + 1):
+        for combination in itertools.combinations(flags, size):
+            before = [f for f, is_global in combination if is_global]
+            after = [f for f, is_global in combination if not is_global]
+            args = top.parse_args([*before, "review", "--host", "0.0.0.0", *after])
+            with pytest.raises(ValueError):
+                check_bind(args.host, args.port)
+
+    # No parameter of the public entry point can express it either: a kwarg
+    # named for the escape hatch must not quietly exist.
+    import inspect
+
+    parameters = set(inspect.signature(serve_review).parameters)
+    assert not parameters & {"allow_remote", "remote", "insecure", "public"}
+    assert "allow_remote" not in inspect.signature(check_bind).parameters
+
+
+def test_the_default_host_is_loopback(tmp_path):
+    """Derived from the requirement, not from the implementation: whatever the
+    default is, it must not reach beyond this machine."""
+    from seshat.cli import _parser
+    from seshat.review import DEFAULT_HOST, is_loopback
+
+    assert is_loopback(DEFAULT_HOST)
+    assert is_loopback(_parser().parse_args(["review"]).host)
+
+
+def test_an_environment_variable_cannot_widen_the_bind(monkeypatch):
+    """SESHAT_HOST selects among loopback addresses and nothing more. An
+    inherited environment is exactly how a bind address arrives unnoticed."""
+    from seshat.cli import _parser
+    from seshat.review import check_bind
+
+    monkeypatch.setenv("SESHAT_HOST", "0.0.0.0")
+    args = _parser().parse_args(["review"])
+    with pytest.raises(ValueError):
+        check_bind(args.host, args.port)
+
+    monkeypatch.setenv("SESHAT_HOST", "::1")
+    assert check_bind(_parser().parse_args(["review"]).host, 8765) is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "127.0.0.2", "::1"])
+def test_loopback_forms_are_accepted(host):
+    """Resolved, not pattern-matched. `localhost` is loopback by convention and
+    127.0.0.2 by arithmetic; a whitelist of literals gets the second one wrong."""
+    from seshat.review import check_bind, is_loopback
+
+    assert is_loopback(host)
+    assert check_bind(host, 8765) is None
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "", "8.8.8.8"])
+def test_wildcards_and_offbox_addresses_are_refused(host):
+    """The wildcards include every interface the machine has. Unresolvable is
+    remote too: an address whose reach cannot be established must not pass."""
+    from seshat.review import check_bind, is_loopback
+
+    assert not is_loopback(host)
+    with pytest.raises(ValueError):
+        check_bind(host, 8765)
+
+
+def test_a_name_resolving_off_box_is_refused(monkeypatch):
+    """A name that looks local can resolve elsewhere, which is the whole reason
+    the check resolves rather than matching strings.
+
+    Resolution is pinned rather than real: a test that needs DNS fails on a
+    train, and this suite is offline by construction.
+    """
+    import socket
+
+    from seshat.review import check_bind, is_loopback
+
+    monkeypatch.setattr(
+        socket, "getaddrinfo",
+        lambda host, port, *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0))
+        ],
+    )
+    assert not is_loopback("looks-local.example")
+    with pytest.raises(ValueError):
+        check_bind("looks-local.example", 8765)
+
+
+def test_an_unresolvable_name_is_refused(monkeypatch):
+    """Fail closed: the failure that matters is publishing by accident."""
+    import socket
+
+    from seshat.review import check_bind
+
+    def fail(*args, **kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    with pytest.raises(ValueError):
+        check_bind("nope.example", 8765)
+
+
+def test_a_refused_bind_writes_nothing(tmp_path):
+    """The token file is created by `Review`, so the refusal has to come first.
+    A refusal that drops a secret on disk is not a refusal."""
+    from seshat.review import token_path
+
+    Store(tmp_path / "n.db").close()
+    with pytest.raises(ValueError):
+        serve_review(tmp_path / "n.db", host="0.0.0.0", snapshots=False)
+    assert not token_path(tmp_path / "n.db").exists()
+
+
+def test_the_gate_is_decidable_without_binding_anything():
+    """The policy must be checkable as a pure function. Otherwise its only test
+    path is a real bind, and removing the gate makes the suite hang rather than
+    fail -- a safety check that fails by hanging is not a safety check."""
+    from seshat.review import check_bind
+
+    assert check_bind("127.0.0.1", 8765) is None
+
+
+def test_an_ipv6_host_selects_an_ipv6_socket():
+    """ThreadingHTTPServer is AF_INET, so a v6 bind against the default raises.
+    The old localhost whitelist accepted `::1` and could never have served it."""
+    import socket
+
+    from seshat.review import address_family
+
+    assert address_family("::1") == socket.AF_INET6
+    assert address_family("127.0.0.1") == socket.AF_INET
 
 
 def test_note_text_is_escaped(tmp_path):
