@@ -24,10 +24,13 @@ silently.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
+import socket
 import sqlite3
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,6 +62,16 @@ MANUAL = "manual"
 """§10.2 provenance, three-valued. The DOM after script execution is materially
 different provenance from pasted text -- better fidelity, but rendered for that
 viewer, personalisation and A/B bucketing included."""
+
+FAILED_PREFIX = "failed:"
+"""Marks a reading the extractor could not produce.
+
+Not a fourth provenance -- there is no witness here -- but it has to occupy
+`extraction` so the row leaves a backlog defined as `extraction IS NULL`.
+Replaceable by every repair path, and by the module's own rule rather than as
+an exception to it: a reading is replaceable exactly when it can be
+regenerated, and re-running the extractor over the same bytes reproduces this
+failure precisely. It is also the reading a human most needs to paste over."""
 
 DEGENERATE_LABELS = frozenset({
     "here", "this", "this article", "this page", "link", "click here", "read more",
@@ -185,15 +198,96 @@ def snapshot_path_for(notes_db: str | Path) -> str:
     return str(path.with_name(path.name + ".snapshots.db"))
 
 
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+"""RFC 6598 shared address space. Not `is_private` by Python's reckoning, but
+not reachable on the public internet either -- it is the carrier-grade NAT
+range, so a target there is somewhere inside an ISP, not on the web."""
+
+
+class RefusedTarget(Exception):
+    """A capture target that resolves somewhere it must not be fetched from."""
+
+
+def _address_objection(address) -> str | None:
+    """Why this address is not a public capture target, or None if it is one."""
+    if address.is_unspecified:
+        return "the unspecified address"
+    if address.is_loopback:
+        return "a loopback address"
+    if address.is_link_local:
+        return "a link-local address (cloud metadata lives here)"
+    if address.is_multicast:
+        return "a multicast address"
+    if address.is_private or address.is_reserved:
+        return "a private or reserved address"
+    if address.version == 4 and address in CGNAT:
+        return "carrier-grade NAT space"
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        # Belt and braces: Python classifies mapped forms correctly today, and
+        # the spec (§10) names them as the usual way such a check goes wrong.
+        return _address_objection(mapped)
+    return None
+
+
+def refuse_target(url: str) -> str | None:
+    """Why `url` must not be fetched, or None if it may be.
+
+    **Note text drives this.** A write makes outbound requests (§6.6), and note
+    text is frequently written by a model summarising a page it just read -- so
+    an attacker-influenced document reaches the fetcher with one hop of
+    laundering. Without this, a note is a request-forgery primitive: the fetcher
+    runs on the user's machine, inside whatever network that machine can see,
+    and the body it retrieves is stored and later rendered in the review UI.
+
+    Refusal is by resolution, and there is no override -- the same rule §10
+    applies to the bind address, pointed outward. Somebody who genuinely wants a
+    private page preserved can paste it (§10.2); that path was already built,
+    already requires a human, and never puts seshat on the private network.
+
+    **What this does not stop:** the name is resolved here and again by the
+    connection, so a DNS answer that changes between the two is not caught.
+    Closing that needs connecting to a pinned address with an explicit Host
+    header and certificate check, which is disproportionate here -- the attacker
+    would need to control DNS for a name a note already cites. Recorded rather
+    than implied, because a guard nobody knows the limits of gets trusted past
+    them.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() not in ("http", "https"):
+        return f"unsupported scheme: {parsed.scheme or url[:40]!r}"
+    host = parsed.hostname
+    if not host:
+        return "no host in the URL"
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 0, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return f"{host} does not resolve ({exc.strerror or exc})"
+    if not infos:
+        return f"{host} resolves to nothing"
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        objection = _address_objection(address)
+        if objection is not None:
+            # Every resolved address must be acceptable, not merely one: a name
+            # answering with both a public and a private address would otherwise
+            # pass here and connect to whichever the resolver hands over next.
+            return f"{host} resolves to {address}, {objection}"
+    return None
+
+
 def http_fetch(target: str, timeout: float = FETCH_TIMEOUT) -> Fetched:
     """Retrieve a URL once. Never raises; every failure is a recorded status.
 
     A target already dead at capture is information, not an error (§6.6): 404
     and 410 record as `gone` rather than being retried indefinitely. Anything
-    that might succeed later records as `unreachable`.
+    that might succeed later records as `unreachable`, and so does a target
+    refused by `refuse_target` -- it lands in triage, where a human can paste
+    the content if they meant it.
     """
-    if not target.lower().startswith(("http://", "https://")):
-        return Fetched(status="unreachable", error=f"unsupported scheme: {target[:40]}")
+    objection = refuse_target(target)
+    if objection is not None:
+        return Fetched(status="unreachable", error=f"refused: {objection}")
 
     request = urllib.request.Request(target, headers={"User-Agent": USER_AGENT})
     opener = urllib.request.build_opener(_LimitedRedirects())
@@ -215,12 +309,27 @@ def http_fetch(target: str, timeout: float = FETCH_TIMEOUT) -> Fetched:
             http_status=exc.code,
             error=f"HTTP {exc.code} {exc.reason}",
         )
+    except RefusedTarget as exc:
+        return Fetched(status="unreachable", error=f"refused: {exc}")
     except Exception as exc:  # timeouts, DNS, TLS, malformed URLs, redirect loops
         return Fetched(status="unreachable", error=f"{type(exc).__name__}: {exc}")
 
 
 class _LimitedRedirects(urllib.request.HTTPRedirectHandler):
+    """Bounded in count, and re-checked at every hop.
+
+    Checking only the original URL would be no check at all: a public URL that
+    302s to 169.254.169.254 is the standard way around a naive filter, and the
+    destination is exactly what gets fetched and stored.
+    """
+
     max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        objection = refuse_target(newurl)
+        if objection is not None:
+            raise RefusedTarget(f"redirect to {newurl[:80]} refused: {objection}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class SnapshotStore:
@@ -378,13 +487,30 @@ class SnapshotStore:
         never from §6.9's expectation check, which is candidate generation for
         review and must not become a verdict.
         """
-        from .extract import FETCH_PREFIX, extract, is_thin
+        from .extract import EXTRACTOR, FETCH_PREFIX, Extraction, extract, is_thin
 
         try:
             result = extract(body, content_type)
         except Exception:
+            # `extract` is documented never to raise, so reaching here means it
+            # was wrong about that. Record the failure ON THE ROW rather than
+            # returning and leaving it for the next drain: the backlog is a
+            # query over `extraction IS NULL`, so an unmarked failure is
+            # re-selected forever and every capture behind it waits (§6.6).
+            #
+            # Marked `failed:`, it leaves the backlog, becomes visible in the
+            # triage queue, and is still re-run by `reset_extraction` when a
+            # better extractor arrives -- the same recovery path every machine
+            # reading has. `thin` because that is exactly what this is: bytes
+            # held, no readable text, and a human who can paste it while the
+            # target may still be live.
             log.exception("extraction failed for %s %s", note_id, target)
-            return False
+            return self.store_extraction(
+                note_id, target,
+                Extraction(title=None, text="", full_length=0,
+                           extractor=f"{FAILED_PREFIX}{EXTRACTOR}"),
+                status="thin",
+            )
         result.extractor = f"{FETCH_PREFIX}{result.extractor}"
         thin = is_thin(result.full_length, len(body), result.unsupported)
         return self.store_extraction(
@@ -392,17 +518,27 @@ class SnapshotStore:
         )
 
     def drain_extraction(self, limit: int = 1000) -> int:
-        """Extract everything holding unread bytes."""
+        """Extract everything holding unread bytes.
+
+        One capture that cannot be read must not hold up the rest. The deadline
+        is on *detection* (§3.6): every row behind a stalled one is a recovery
+        window closing unwatched, so a row that cannot be processed is marked
+        and stepped over, never returned on.
+        """
         done = 0
         while done < limit:
             batch = self.needs_extraction(min(32, limit - done))
             if not batch:
                 break
+            progressed = False
             for note_id, target, body, content_type in batch:
                 if self.extract_one(note_id, target, body, content_type):
                     done += 1
-                else:
-                    return done
+                    progressed = True
+            if not progressed:
+                # Nothing in a full batch could be marked either way. Returning
+                # beats spinning: the batch query would hand back the same rows.
+                break
         return done
 
     def extraction_backlog(self) -> int:
@@ -480,6 +616,10 @@ class SnapshotStore:
         was read from, those bytes are never touched, and re-running the
         extractor reproduces it exactly.
 
+        A `failed:` marker is replaceable for the same reason and more obviously:
+        it holds no reading at all, only the record that the extractor could not
+        produce one, and it is the case a human is most likely to be repairing.
+
         Nothing human-supplied is replaceable. A pasted reading arrived by hand
         and nothing in the store can reproduce it. A browser reading looks
         regenerable but is not, in the case that matters: when it repairs an
@@ -497,8 +637,8 @@ class SnapshotStore:
         self.db.execute(
             """UPDATE snapshot SET extraction = NULL
                WHERE note_id = ? AND target = ?
-                 AND (extraction IS NULL OR extraction LIKE ?)""",
-            (note_id, target, FETCH + ":%"),
+                 AND (extraction IS NULL OR extraction LIKE ? OR extraction LIKE ?)""",
+            (note_id, target, FETCH + ":%", FAILED_PREFIX + "%"),
         )
 
     def record_browser(

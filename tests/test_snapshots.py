@@ -437,3 +437,330 @@ def test_the_captured_bytes_are_what_is_immutable(linked):
     assert linked.snapshots.sources_for(note_id)[0]["text"] == "a human reading"
     assert linked.snapshots.db.execute(
         "SELECT body_hash FROM raw").fetchone()["body_hash"] == before
+
+
+# ------------------------------------------------- a capture that cannot be read
+
+
+def _unreadable(monkeypatch, marker=b"POISON"):
+    """Make extraction raise for one specific body, leaving others alone."""
+    import seshat.extract as extract_module
+
+    original = extract_module.extract
+
+    def selective(body, content_type=None):
+        if marker in body:
+            raise RuntimeError("parser blew up")
+        return original(body, content_type)
+
+    monkeypatch.setattr(extract_module, "extract", selective)
+
+
+def test_one_unreadable_capture_does_not_stall_the_others(tmp_path, monkeypatch):
+    """§3.6: the deadline is on DETECTION. Every row behind a stalled one is a
+    recovery window closing unwatched, so a row that cannot be read must be
+    stepped over rather than returned on."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    bad = b"<html><body>POISON" + b"x" * 3000 + b"</body></html>"
+    good = b"<html><body><p>" + b"readable prose. " * 200 + b"</p></body></html>"
+    for note_id, body in (("aaa", bad), ("bbb", good)):
+        snaps.enqueue(note_id, [(f"http://{note_id}", None, None)])
+        snaps.record(note_id, f"http://{note_id}",
+                     Fetched(status="ok", content_type="text/html", body=body))
+
+    _unreadable(monkeypatch)
+    assert snaps.extraction_backlog() == 2
+    snaps.drain_extraction()
+
+    # The readable one was read despite being queued behind the other.
+    row = snaps.db.execute(
+        "SELECT text, extraction FROM snapshot WHERE note_id = 'bbb'"
+    ).fetchone()
+    assert "readable prose" in row["text"]
+    assert row["extraction"].startswith("fetch:")
+
+
+def test_an_unreadable_capture_leaves_the_backlog_and_surfaces_for_a_human(
+    tmp_path, monkeypatch
+):
+    """Marked rather than skipped: the backlog is a query over `extraction IS
+    NULL`, so an unmarked failure is re-selected forever."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    body = b"<html><body>POISON" + b"x" * 3000 + b"</body></html>"
+    snaps.enqueue("aaa", [("http://aaa", None, None)])
+    snaps.record("aaa", "http://aaa",
+                 Fetched(status="ok", content_type="text/html", body=body))
+
+    _unreadable(monkeypatch)
+    snaps.drain_extraction()
+
+    assert snaps.extraction_backlog() == 0, "a marked failure must leave the backlog"
+    row = snaps.db.execute("SELECT status, extraction FROM snapshot").fetchone()
+    assert row["extraction"].startswith("failed:")
+    # Bytes held, nothing readable, target possibly still live: that is triage.
+    assert row["status"] == "thin"
+    assert ("aaa", "http://aaa") in {
+        (f["note_id"], f["target"]) for f in snaps.failures()
+    }
+
+
+def test_a_failed_reading_can_still_be_pasted_over(tmp_path, monkeypatch):
+    """The row a human most needs to repair. A `failed:` marker holds no witness
+    and re-running reproduces it exactly, so it is replaceable under the same
+    rule that protects pasted and browser readings."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    body = b"<html><body>POISON" + b"x" * 3000 + b"</body></html>"
+    snaps.enqueue("aaa", [("http://aaa", None, None)])
+    snaps.record("aaa", "http://aaa",
+                 Fetched(status="ok", content_type="text/html", body=body))
+    _unreadable(monkeypatch)
+    snaps.drain_extraction()
+
+    assert snaps.paste("aaa", "http://aaa", "what the page actually said")
+    row = snaps.db.execute("SELECT text, extraction, status FROM snapshot").fetchone()
+    assert row["text"] == "what the page actually said"
+    assert row["extraction"] == "manual"
+    assert row["status"] == "ok"
+    # And the bytes the fetcher received are untouched, as always.
+    assert snaps.db.execute("SELECT COUNT(*) FROM raw").fetchone()[0] == 1
+
+
+def test_a_failed_reading_is_retried_by_reset_extraction(tmp_path, monkeypatch):
+    """A better extractor is the other recovery path, and it must reach these
+    rows: that is the whole reason the bytes were kept."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    body = b"<html><body>POISON<p>" + b"real text here. " * 100 + b"</p></body></html>"
+    snaps.enqueue("aaa", [("http://aaa", None, None)])
+    snaps.record("aaa", "http://aaa",
+                 Fetched(status="ok", content_type="text/html", body=body))
+    _unreadable(monkeypatch)
+    snaps.drain_extraction()
+    assert snaps.db.execute("SELECT extraction FROM snapshot").fetchone()[0].startswith(
+        "failed:"
+    )
+
+    monkeypatch.undo()  # the better extractor arrives
+    assert snaps.reset_extraction() == 1
+    assert snaps.drain_extraction() == 1
+    row = snaps.db.execute("SELECT text, extraction FROM snapshot").fetchone()
+    assert "real text here" in row["text"]
+    assert row["extraction"].startswith("fetch:")
+
+
+def test_a_row_that_cannot_even_be_marked_does_not_stall_the_rest(
+    tmp_path, monkeypatch
+):
+    """Defence in depth for the marking above. If recording the failure itself
+    fails, `extract_one` returns False -- and the loop must still step over it.
+    Without this case the early-return bug is untestable, because marking makes
+    the failure path return True and the branch unreachable.
+    """
+    snaps = SnapshotStore(tmp_path / "s.db")
+    good = b"<html><body><p>" + b"readable prose. " * 200 + b"</p></body></html>"
+    bad = b"<html><body>POISON" + b"x" * 3000 + b"</body></html>"
+    # 'aaa' sorts first, so the unmarkable row is reached first in the batch.
+    for note_id, body in (("aaa", bad), ("bbb", good)):
+        snaps.enqueue(note_id, [(f"http://{note_id}", None, None)])
+        snaps.record(note_id, f"http://{note_id}",
+                     Fetched(status="ok", content_type="text/html", body=body))
+
+    _unreadable(monkeypatch)
+    real_store = snaps.store_extraction
+
+    def refuse_to_mark(note_id, target, extraction, status=None):
+        if extraction.extractor.startswith("failed:"):
+            return False  # could not even record the failure
+        return real_store(note_id, target, extraction, status)
+
+    monkeypatch.setattr(snaps, "store_extraction", refuse_to_mark)
+    snaps.drain_extraction()
+
+    row = snaps.db.execute(
+        "SELECT text FROM snapshot WHERE note_id = 'bbb'"
+    ).fetchone()
+    assert row["text"] and "readable prose" in row["text"], (
+        "a row that could not be marked must be stepped over, not returned on"
+    )
+
+
+# ------------------------------------------------------- outbound target policy
+
+
+@pytest.mark.parametrize(
+    "url,fragment",
+    [
+        ("http://127.0.0.1:8765/note/x", "loopback"),
+        ("http://169.254.169.254/latest/meta-data/", "link-local"),
+        ("http://192.168.1.1/admin", "private"),
+        ("http://10.0.0.5/", "private"),
+        ("http://[::1]:8765/", "loopback"),
+        ("http://[::ffff:127.0.0.1]/", "loopback"),
+        ("http://[::ffff:169.254.169.254]/", "link-local"),
+        ("http://100.64.0.1/", "carrier-grade"),
+        ("http://0.0.0.0/", "unspecified"),
+        ("ftp://example.com/x", "scheme"),
+        ("http:///nohost", "host"),
+    ],
+)
+def test_private_targets_are_refused(url, fragment):
+    """Note text drives outbound requests, and note text is often written by a
+    model summarising a page it just read. Without this a note is a
+    request-forgery primitive aimed at whatever network the machine can see."""
+    from seshat.snapshots import refuse_target
+
+    objection = refuse_target(url)
+    assert objection is not None, f"{url} should have been refused"
+    assert fragment in objection
+
+
+def _resolves_to(monkeypatch, address):
+    """Pin name resolution. Keeps the suite off the network -- a test that does
+    a real DNS lookup is a test that fails on a train."""
+    import socket
+
+    def fake(host, port, *args, **kwargs):
+        family = socket.AF_INET6 if ":" in address else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, 6, "", (address, port or 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+
+def test_a_public_target_is_allowed(monkeypatch):
+    """The guard must not refuse the thing it exists to permit."""
+    from seshat.snapshots import refuse_target
+
+    _resolves_to(monkeypatch, "93.184.216.34")
+    assert refuse_target("https://example.com/page") is None
+
+
+def test_a_name_resolving_into_private_space_is_refused(monkeypatch):
+    """The name says nothing; the address does. A public hostname pointing at
+    169.254.169.254 is the ordinary way this attack is delivered."""
+    from seshat.snapshots import refuse_target
+
+    _resolves_to(monkeypatch, "169.254.169.254")
+    objection = refuse_target("https://totally-normal.example/")
+    assert objection is not None and "link-local" in objection
+
+
+def test_a_name_that_does_not_resolve_is_refused(monkeypatch):
+    """Fail closed, exactly as the bind rule does: an address whose reach cannot
+    be established is not a target."""
+    import socket
+
+    from seshat.snapshots import refuse_target
+
+    def fail(*args, **kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
+    assert refuse_target("https://nope.example/") is not None
+
+
+def test_a_name_with_one_private_address_among_several_is_refused(monkeypatch):
+    """Every resolved address must pass, not merely one: a name answering with
+    both would otherwise connect to whichever the resolver hands over next."""
+    import socket
+
+    from seshat.snapshots import refuse_target
+
+    def both(host, port, *args, **kwargs):
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port or 0)),
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", both)
+    assert refuse_target("https://split-horizon.example/") is not None
+
+
+def test_a_refused_target_records_a_status_and_reaches_triage(tmp_path):
+    """Refusal is a capture outcome, not a crash: the note is already written,
+    and a human who meant it can paste the content."""
+    import time
+
+    from seshat.snapshots import http_fetch
+
+    # The refusal must be a DECISION, not a timeout. An unguarded fetch of a
+    # metadata address reaches the same `unreachable` status by simply failing,
+    # so status alone cannot tell the guard working from the guard absent --
+    # the reason and the speed are what distinguish them.
+    started = time.monotonic()
+    direct = http_fetch("http://169.254.169.254/latest/meta-data/", timeout=20)
+    assert "refused" in (direct.error or ""), "no refusal recorded; was it just unreachable?"
+    assert time.monotonic() - started < 2.0, "refused before connecting, not after"
+
+    snaps = SnapshotStore(tmp_path / "s.db")
+    snaps.enqueue("aaa", [("http://169.254.169.254/latest/meta-data/", None, None)])
+    SnapshotWorker(snaps, max_attempts=1).run_once()
+
+    row = snaps.db.execute("SELECT status FROM snapshot").fetchone()
+    assert row["status"] == "unreachable"
+    assert snaps.db.execute("SELECT COUNT(*) FROM raw").fetchone()[0] == 0, (
+        "nothing may be stored from a refused target"
+    )
+    assert ("aaa", "http://169.254.169.254/latest/meta-data/") in {
+        (f["note_id"], f["target"]) for f in snaps.failures()
+    }
+
+
+def test_a_redirect_into_private_space_is_refused():
+    """The case a check on the original URL alone misses entirely: a public URL
+    that 302s inward. The destination is what would be fetched and stored.
+
+    Driven through urllib's real redirect machinery against a real redirecting
+    server. The entry check is stepped around deliberately -- the local server
+    can only live on loopback, which `http_fetch` refuses outright, so going in
+    at the opener is the only way to exercise the hop rather than the entrance.
+    """
+    import http.server
+    import threading
+    import urllib.request
+
+    from seshat.snapshots import USER_AGENT, RefusedTarget, _LimitedRedirects
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", "http://169.254.169.254/latest/meta-data/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        opener = urllib.request.build_opener(_LimitedRedirects())
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/", headers={"User-Agent": USER_AGENT}
+        )
+        with pytest.raises(RefusedTarget) as raised:
+            opener.open(request, timeout=5)
+    finally:
+        server.shutdown()
+
+    assert "169.254.169.254" in str(raised.value)
+
+
+def test_a_redirect_to_a_public_target_still_follows(monkeypatch):
+    """The guard must not break ordinary redirects, which are most of the web.
+
+    Exercised at `redirect_request` rather than through a server: any server
+    this suite can start is on loopback, which the policy refuses by design, so
+    a live round trip cannot distinguish the guard working from the guard
+    over-firing.
+    """
+    import urllib.request
+
+    from seshat.snapshots import _LimitedRedirects
+
+    _resolves_to(monkeypatch, "93.184.216.34")
+    request = urllib.request.Request("https://example.com/moved")
+    followed = _LimitedRedirects().redirect_request(
+        request, None, 302, "Found", {}, "https://example.com/landed"
+    )
+    assert followed is not None
+    assert followed.full_url == "https://example.com/landed"
