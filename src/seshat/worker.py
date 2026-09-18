@@ -57,11 +57,27 @@ class EmbeddingWorker:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            # Cleared before the work rather than after the wait: the standard
+            # ordering, where you drop the signal and then look, so anything
+            # arriving after you looked re-raises it.
+            #
+            # No bug was fixed by moving it, and the review note claiming one
+            # was wrong. Traced: a notify during `run_once` sets the event, the
+            # wait returns at once and the next `run_once` takes the work; a
+            # notify between the wait and the clear is dropped unacted, but the
+            # very next statement is `run_once`, which drains whatever is
+            # pending. Nothing is ever lost either way. The real defect was
+            # below -- a full batch slept a whole poll interval.
+            self._wake.clear()
             wait = self.poll
             try:
                 embedded = self.run_once()
-                if embedded == 0:
-                    wait = self.poll
+                if embedded:
+                    # A full batch means there is probably another behind it.
+                    # Sleeping the poll interval between them drained a backlog
+                    # at `batch` notes per `poll` seconds -- 16 per 2s -- when
+                    # the embedder was ready to go straight on.
+                    continue
             except EmbedderUnavailable as exc:
                 # Expected, not exceptional: Ollama is not running, or the
                 # model is still loading. Back off and keep the backlog.
@@ -71,7 +87,6 @@ class EmbeddingWorker:
                 log.exception("embedding worker iteration failed")
                 wait = self.backoff
             self._wake.wait(wait)
-            self._wake.clear()
 
     def run_once(self) -> int:
         """Embed one batch. Returns how many notes were embedded.

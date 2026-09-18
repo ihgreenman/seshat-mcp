@@ -794,3 +794,104 @@ def test_reference_style_anchor_text_reaches_the_expectation(tmp_path):
     assert queued["https://example.com/limits"] == ("rate limits", "anchor")
     # An autolink carries no anchor text, so it takes the fallback -- correctly.
     assert queued["https://example.com/auto"][1] != "anchor"
+
+
+# ------------------------------------------------------------- witness safety
+
+
+def test_retry_refuses_a_capture_that_holds_bytes(tmp_path):
+    """A failed capture that nonetheless retrieved something HAS a witness. A
+    paywall interstitial is a truthful record of what the URL served an
+    anonymous fetcher, and `paste()` is built around never touching it.
+
+    Re-fetching deleted it first and might come back with nothing, trading the
+    only unrecoverable data in the system for a second attempt.
+    """
+    snaps = SnapshotStore(tmp_path / "s.db")
+    # Genuinely thin: a big response whose readable text is almost nothing --
+    # the paywall/JS-shell shape. The script body is dropped by the extractor.
+    body = (b"<html><body><script>" + b"var x=1;" * 500
+            + b"</script><p>Subscribe</p></body></html>")
+    snaps.enqueue("aaa", [("http://paywalled", None, None)])
+    snaps.record("aaa", "http://paywalled",
+                 Fetched(status="ok", content_type="text/html", body=body))
+    snaps.extract_one("aaa", "http://paywalled", body, "text/html")
+    assert snaps.db.execute("SELECT status FROM snapshot").fetchone()[0] == "thin"
+
+    assert snaps.retry("aaa", "http://paywalled") is False
+    assert snaps.db.execute("SELECT COUNT(*) FROM raw").fetchone()[0] == 1
+    assert snaps.db.execute("SELECT COUNT(*) FROM snapshot").fetchone()[0] == 1
+    assert snaps.db.execute("SELECT COUNT(*) FROM fetch_queue").fetchone()[0] == 0
+
+
+def test_retry_still_works_when_nothing_was_captured(tmp_path):
+    """The case it exists for: a fetch that failed outright holds no bytes, so
+    there is no witness to lose."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    snaps.enqueue("aaa", [("http://down", None, None)])
+    snaps.record("aaa", "http://down",
+                 Fetched(status="unreachable", error="timed out"))
+    assert snaps.db.execute("SELECT COUNT(*) FROM raw").fetchone()[0] == 0
+
+    assert snaps.retry("aaa", "http://down") is True
+    assert snaps.db.execute("SELECT COUNT(*) FROM fetch_queue").fetchone()[0] == 1
+
+
+def test_a_newer_snapshot_store_is_refused_without_being_written_to(tmp_path):
+    """The rule Store.__init__ states, applied here too: setting journal_mode on
+    a database about to be refused modifies it, and a refusal that edits the
+    thing it refused is not a refusal."""
+    import sqlite3
+
+    from seshat.snapshots import SCHEMA_VERSION
+
+    path = tmp_path / "s.db"
+    SnapshotStore(path).close()
+    db = sqlite3.connect(path)
+    db.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 5}")
+    db.execute("PRAGMA journal_mode = DELETE")
+    db.commit()
+    before = db.execute("PRAGMA journal_mode").fetchone()[0]
+    db.close()
+
+    with pytest.raises(RuntimeError, match="newer than this build"):
+        SnapshotStore(path)
+
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA journal_mode").fetchone()[0] == before
+    db.close()
+
+
+def test_a_browser_capture_without_an_expectation_records_no_source(tmp_path):
+    """The source describes an expectation, so it cannot outlive one. A row
+    claiming `anchor` with a null expectation says a label was read that never
+    existed."""
+    snaps = SnapshotStore(tmp_path / "s.db")
+    snaps.record_browser("aaa", "http://x", "some page text " * 40)
+    row = snaps.db.execute(
+        "SELECT expectation, expectation_source FROM snapshot"
+    ).fetchone()
+    assert row["expectation"] is None
+    assert row["expectation_source"] is None
+
+
+def test_a_browser_capture_with_an_expectation_records_anchor(tmp_path):
+    snaps = SnapshotStore(tmp_path / "s.db")
+    snaps.record_browser("aaa", "http://x", "some page text " * 40,
+                         expectation="what I wanted")
+    row = snaps.db.execute(
+        "SELECT expectation, expectation_source FROM snapshot"
+    ).fetchone()
+    assert row["expectation"] == "what I wanted"
+    assert row["expectation_source"] == "anchor"
+
+
+def test_the_user_agent_states_the_real_version_and_project():
+    """It goes to every target a note cites, so it should be true. It claimed
+    0.1 against 0.3.0 and cited a placeholder URL resolving to nothing."""
+    from seshat import __version__
+    from seshat.snapshots import PROJECT_URL, USER_AGENT
+
+    assert f"seshat/{__version__}" in USER_AGENT
+    assert PROJECT_URL in USER_AGENT
+    assert PROJECT_URL.startswith("https://") and PROJECT_URL.count("/") > 2

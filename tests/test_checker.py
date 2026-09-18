@@ -624,3 +624,101 @@ def test_the_review_interface_sets_a_budget_and_the_cli_does_not():
     # Unlimited unless asked: 0 from the CLI means "no cap".
     assert DEFAULT_PAIR_BUDGET is None
     assert _parser().parse_args(["check"]).pair_budget == 0
+
+
+# ------------------------------------------------- reachability without frames
+
+
+def _graph(tmp_path, edges):
+    """A store whose supersession graph is exactly `edges`, cycles included.
+
+    Written straight to `assessment` rather than through `add_assessment`,
+    which rejects cycles (§3.4) -- and a cycle is precisely what the checker
+    has to survive, since `check_cycles` exists to report one.
+    """
+    nodes = sorted({n for edge in edges for n in edge})
+    store = Store(tmp_path / "n.db")
+    real = {node: store.create_note(node, f"body {node}")[0] for node in nodes}
+    stamp = "2026-01-01T00:00:00.000000+00:00"
+    with store.db:
+        for index, (a, b) in enumerate(edges):
+            store.db.execute(
+                "INSERT INTO assessment VALUES (?, ?, ?, NULL, ?)",
+                (real[a], real[b], 0.5, f"{stamp[:-7]}{index:06d}+00:00"),
+            )
+    store.db.commit()
+    store.close()
+    return tmp_path / "n.db", real
+
+
+def _closure_by_fixpoint(edges):
+    """Transitive closure by repeated relaxation over the whole edge set.
+
+    Warshall-shaped: no traversal, no queue, no per-node walk -- it just keeps
+    composing the relation with itself until nothing changes. Deliberately not
+    the shape of the implementation, which is a breadth-first walk per node; a
+    reference that shared the algorithm would reproduce its bugs in green.
+    """
+    nodes = {n for edge in edges for n in edge}
+    reach = {n: {b for a, b in edges if a == n} for n in nodes}
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            grown = set(reach[node])
+            for mid in list(reach[node]):
+                grown |= reach[mid]
+            if grown != reach[node]:
+                reach[node] = grown
+                changed = True
+    return {n: v for n, v in reach.items() if v}
+
+
+@pytest.mark.parametrize(
+    "edges",
+    [
+        [("a", "b"), ("b", "c"), ("c", "a")],                    # a bare cycle
+        [("a", "b"), ("b", "c"), ("c", "b")],                    # a cycle with a tail
+        [("a", "b"), ("b", "c"), ("c", "a"), ("c", "d")],        # a cycle with an exit
+        [("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")],        # a diamond
+        [("a", "b"), ("c", "d")],                                # disjoint
+    ],
+)
+def test_reachability_matches_an_independent_closure(tmp_path, edges):
+    """What is asserted is the agreement between two algorithms, not the output
+    of one. Cycles included: they terminate here by construction rather than by
+    detection, and that is the part worth pinning."""
+    path, real = _graph(tmp_path, edges)
+    checker = Checker(str(path))
+    try:
+        mine = {k: v for k, v in checker._reachable().items() if v}
+    finally:
+        checker.close()
+
+    expected = {
+        real[node]: {real[d] for d in descendants}
+        for node, descendants in _closure_by_fixpoint(edges).items()
+        if descendants
+    }
+    assert mine == expected
+
+
+def test_a_long_chain_does_not_exhaust_the_stack(tmp_path):
+    """One Python frame per edge put a recursion limit on how long a belief's
+    history may be, in the component whose job is surviving a store that has
+    gone wrong. A thousand corrections to one note is unusual; it is not a
+    defect, and it should not be the checker that falls over."""
+    import sys
+
+    length = sys.getrecursionlimit() * 2
+    edges = [(f"n{i:05d}", f"n{i + 1:05d}") for i in range(length)]
+    path, real = _graph(tmp_path, edges)
+
+    checker = Checker(str(path))
+    try:
+        reachable = checker._reachable()
+    finally:
+        checker.close()
+
+    assert len(reachable[real["n00000"]]) == length
+    assert real[f"n{length:05d}"] in reachable[real["n00000"]]

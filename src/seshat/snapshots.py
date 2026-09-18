@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
+from . import __version__
 from .extract import expectation_met
 
 log = logging.getLogger("seshat.snapshots")
@@ -49,7 +50,15 @@ over, and a truncated body is a permanently degraded witness."""
 
 FETCH_TIMEOUT = 20.0
 MAX_REDIRECTS = 5
-USER_AGENT = "seshat/0.1 (+https://github.com/; personal note store; capture-once)"
+PROJECT_URL = "https://github.com/ihgreenman/seshat-mcp"
+
+USER_AGENT = f"seshat/{__version__} (+{PROJECT_URL}; personal note store; capture-once)"
+"""Sent to every target a note cites, so it should be true.
+
+It used to claim 0.1 against a software version of 0.3.0, and carried a bare
+`+https://github.com/` -- a placeholder that resolves to nothing and tells an
+operator reading their logs less than saying nothing would. Both now come from
+the one place each is defined."""
 
 STATUSES = ("ok", "gone", "unreachable", "thin")
 """§6.6. `thin` means extraction yielded implausibly little, and is the one
@@ -342,9 +351,18 @@ class SnapshotStore:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        # Version first, before any PRAGMA that writes -- the same rule
+        # `Store.__init__` states and for the same reason: setting journal_mode
+        # on a database that is about to be refused modifies the file, and a
+        # refusal that edits the thing it refused is not a refusal.
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"snapshot store {self.path} is version {version}, newer than this "
+                f"build's {SCHEMA_VERSION}. Upgrade seshat."
+            )
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
-        version = self.db.execute("PRAGMA user_version").fetchone()[0]
         if version == 0:
             with self.db:
                 self.db.executescript(SCHEMA)
@@ -357,11 +375,6 @@ class SnapshotStore:
             with self.db:
                 self.db.executescript(ADDITIVE)
                 self.db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        elif version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"snapshot store {self.path} is version {version}, newer than this "
-                f"build's {SCHEMA_VERSION}. Upgrade seshat."
-            )
 
     def close(self) -> None:
         self.db.close()
@@ -680,8 +693,12 @@ class SnapshotStore:
                 """INSERT OR IGNORE INTO snapshot(
                        note_id, target, captured_at, status, raw_length, expectation,
                        expectation_source, http_status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'anchor', NULL)""",
-                (note_id, target, stamp, "thin" if thin else "ok", raw_length, expectation),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                # The source describes an expectation, so it cannot outlive one:
+                # a row claiming `anchor` with a null expectation says a label
+                # was read that never existed.
+                (note_id, target, stamp, "thin" if thin else "ok", raw_length,
+                 expectation, "anchor" if expectation else None),
             )
             if html:
                 self.db.execute(
@@ -794,8 +811,13 @@ class SnapshotStore:
             }
 
     def retry(self, note_id: str, target: str) -> bool:
-        """Re-queue a transient failure (§10.2). Only failures: a successful
-        capture is immutable and re-fetching it would be pointless."""
+        """Re-queue a transient failure (§10.2). Returns whether it was queued.
+
+        Only failures, and only failures that retrieved nothing. A successful
+        capture is immutable and re-fetching it would be pointless; a failed one
+        that nonetheless holds bytes has a witness, and those bytes are the only
+        data in the system nothing can regenerate.
+        """
         with self._lock, self.db:
             row = self.db.execute(
                 """SELECT status, expectation, expectation_source FROM snapshot
@@ -804,11 +826,31 @@ class SnapshotStore:
             ).fetchone()
             if row is None or row["status"] == "ok":
                 return False
+            held = self.db.execute(
+                "SELECT 1 FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
+            ).fetchone()
+            if held is not None:
+                # Bytes were retrieved, so this capture HAS a witness -- a
+                # paywall interstitial is still a truthful record of what the
+                # URL served an anonymous fetcher, and `paste()` is built around
+                # never touching it. Re-fetching would delete it and might come
+                # back with nothing, trading the only unrecoverable data in the
+                # system for a second attempt. Repair by pasting instead.
+                #
+                # Unreachable from the review UI today, which only offers retry
+                # for `unreachable` and those hold no bytes. Guarded here rather
+                # than relying on which button gets rendered.
+                log.info(
+                    "refusing to re-queue %s %s: %d bytes already captured",
+                    note_id, target,
+                    self.db.execute(
+                        "SELECT body_length FROM raw WHERE note_id = ? AND target = ?",
+                        (note_id, target),
+                    ).fetchone()[0],
+                )
+                return False
             self.db.execute(
                 "DELETE FROM snapshot WHERE note_id = ? AND target = ?", (note_id, target)
-            )
-            self.db.execute(
-                "DELETE FROM raw WHERE note_id = ? AND target = ?", (note_id, target)
             )
             self.db.execute(
                 """INSERT OR REPLACE INTO fetch_queue(

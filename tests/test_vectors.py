@@ -463,3 +463,81 @@ def test_reembed_clears_the_vectors_even_during_a_failure_cooldown(tmp_path):
     assert store.db.execute("SELECT COUNT(*) FROM note_vec").fetchone()[0] == 0, (
         "vectors outlived the provenance that described them"
     )
+
+
+def test_a_note_written_mid_batch_is_embedded_promptly(tmp_path):
+    """A behavioural property, not a proof about one line.
+
+    This was written to pin a lost notify, and there is no lost notify to pin:
+    with the clear after the wait, a signal dropped unacted is immediately
+    followed by `run_once`, which drains whatever is pending. The test passes
+    under both orderings and is kept for the property it states rather than the
+    line it was aimed at.
+    """
+    import threading
+    import time
+
+    class Counting:
+        model = "m"
+        dim = 4
+
+        def __init__(self):
+            self.batches = 0
+
+        def embed(self, texts, timeout=0):
+            self.batches += 1
+            time.sleep(0.3)  # long enough for a notify to land mid-batch
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    store = Store(tmp_path / "n.db", embedder=Counting())
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+
+    worker = EmbeddingWorker(store, poll=30.0)  # a poll so long only a notify can wake it
+    store._on_note_written = worker.notify
+    store.create_note("first", "body one")
+    worker.start()
+    try:
+        # Land the second write while the first batch is still in the embedder.
+        time.sleep(0.1)
+        store.create_note("second", "body two")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and store.embedding_backlog():
+            time.sleep(0.05)
+        assert store.embedding_backlog() == 0, (
+            "a note written mid-batch waited for the poll interval"
+        )
+    finally:
+        worker.stop()
+
+
+def test_the_worker_continues_straight_on_after_a_full_batch(tmp_path):
+    """Sleeping the poll interval between full batches drained a backlog at
+    `batch` notes per `poll` seconds -- 16 per 2s -- when the embedder was ready
+    to go straight on."""
+    import time
+
+    class Fixed:
+        model = "m"
+        dim = 4
+
+        def embed(self, texts, timeout=0):
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    store = Store(tmp_path / "n.db", embedder=Fixed())
+    if not store.vector_loaded:
+        pytest.skip("sqlite-vec not available")
+    for index in range(10):
+        store.create_note(f"note {index}", f"body {index}")
+
+    worker = EmbeddingWorker(store, poll=30.0, batch=2)  # 5 batches at 2 each
+    worker.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and store.embedding_backlog():
+            time.sleep(0.05)
+        assert store.embedding_backlog() == 0, (
+            "the worker waited a poll interval between full batches"
+        )
+    finally:
+        worker.stop()

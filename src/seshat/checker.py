@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -316,18 +316,16 @@ class Checker:
                 {"target": row["target"]},
             ))
 
+        from .extract import expectation_met
+
         unmet = self.snapshots.execute(
-            """SELECT note_id, target, expectation, expectation_source
+            """SELECT note_id, target, expectation, expectation_source, text
                FROM snapshot WHERE expectation IS NOT NULL AND text IS NOT NULL"""
         ).fetchall()
         for row in unmet:
-            from .extract import expectation_met
-
-            text = self.snapshots.execute(
-                "SELECT text FROM snapshot WHERE note_id = ? AND target = ?",
-                (row["note_id"], row["target"]),
-            ).fetchone()["text"]
-            if expectation_met(row["expectation"], text) is False:
+            # `text` comes from the row already in hand. It was being re-selected
+            # by primary key for every row the same query had just returned.
+            if expectation_met(row["expectation"], row["text"]) is False:
                 findings.append(Finding(
                     "expectation not met", "review",
                     f"{row['target']} does not contain what the citation sought "
@@ -401,25 +399,41 @@ class Checker:
         return out
 
     def _reachable(self) -> dict[str, set[str]]:
-        """Descendant sets, so 'is there a path between these two' is a lookup."""
+        """Descendant sets, so "is there a path between these two" is a lookup.
+
+        A breadth-first walk from each node with outgoing edges. Iterative, so
+        the length of a belief's history is not bounded by the recursion limit
+        -- a thousand corrections to one note is unusual but it is not a defect,
+        and it should not be the checker that falls over. And correct on cyclic
+        input, which matters because a cycle is exactly the state this component
+        exists to survive: `check_cycles` reports one, so `_reachable` must be
+        able to run on a store that has one.
+
+        Memoisation was tried and removed. Sharing descendant sets between roots
+        is the obvious optimisation and it is wrong on cycles: a successor still
+        on the current path has no set yet, so the node above it is memoised
+        with a hole, and every later reader of that entry inherits the hole.
+        Getting it right needs the strongly-connected components, which is a lot
+        of machinery for a helper whose only caller is already quadratic and now
+        budgeted. This is O(V*E) against that O(V^2*d), and it is obviously
+        correct, which is worth more here than a constant factor.
+        """
         adjacency: dict[str, list[str]] = defaultdict(list)
         for old, new, _ in self._edges():
             adjacency[old].append(new)
-        memo: dict[str, set[str]] = {}
 
-        def descendants(node: str, stack: frozenset[str] = frozenset()) -> set[str]:
-            if node in memo:
-                return memo[node]
-            if node in stack:  # a cycle; check_cycles reports it separately
-                return set()
-            found: set[str] = set()
-            for nxt in adjacency.get(node, ()):
-                found.add(nxt)
-                found |= descendants(nxt, stack | {node})
-            memo[node] = found
-            return found
-
-        return {n: descendants(n) for n in {e[0] for e in self._edges()} | set(adjacency)}
+        closure: dict[str, set[str]] = {}
+        for root in adjacency:
+            seen: set[str] = set()
+            queue = deque(adjacency[root])
+            while queue:
+                node = queue.popleft()
+                if node in seen:
+                    continue
+                seen.add(node)
+                queue.extend(adjacency.get(node, ()))
+            closure[root] = seen
+        return closure
 
     def check_suggested_links(self) -> list[Finding]:
         """Pairs with high cosine similarity and no path between them (§7.2).

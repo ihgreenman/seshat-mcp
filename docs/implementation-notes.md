@@ -8,8 +8,9 @@ Spec section references are to [`seshat-mcp-spec.md`](seshat-mcp-spec.md).
 
 ## Status
 
-All six increments of §11.3 are implemented, against spec 1.3 (software 0.3.0,
-store schema 4, snapshot schema 3).
+All six increments of §11.3 are implemented, against spec 1.4 (software 0.8.0,
+store schema 4, snapshot schema 3). Python ≥ 3.13, matching current Debian
+stable.
 
 **Schema 4 has no migration path.** It consolidates versions 1–3: spec 1.3 needed
 a column on a table nothing had populated yet, and a one-time reset was taken

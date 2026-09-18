@@ -174,11 +174,28 @@ def test_context_cannot_find_a_note_by_its_own_id(store, mk):
     Open question in docs/retrieval-findings.md §3.1 -- if the spec decides
     context should resolve identifiers, this test changes with it.
     """
-    note_id = mk("Resampler drops a sample at block boundaries")
-    assert [h.id for h in store.context(note_id)] == []
+    # The id is pinned, not minted at random. A four-word BIP-39 id OR-expands
+    # against FTS, so if any drawn word also appears in the note's own text the
+    # note matches itself and this test goes red -- measured at 0.2% per run
+    # against the wording below, which is ~1 red in 3 for every 200 CI runs.
+    # An intermittent failure teaches people to re-run rather than to look.
+    import seshat.ids as ids_module
 
-    citing = store.create_note("confirmed on hardware", f"reproduced what {note_id} describes")[0]
-    assert [h.id for h in store.context(note_id)] == [citing], "citations are findable"
+    pinned = "abandon-ability-able-about"
+    original = ids_module.new_id
+    ids_module.new_id = lambda *args, **kwargs: pinned
+    try:
+        note_id = mk("Resampler drops a sample at block boundaries")
+        assert note_id == pinned
+        ids_module.new_id = original
+        assert [h.id for h in store.context(note_id)] == []
+
+        citing = store.create_note(
+            "confirmed on hardware", f"reproduced what {note_id} describes"
+        )[0]
+        assert [h.id for h in store.context(note_id)] == [citing], "citations are findable"
+    finally:
+        ids_module.new_id = original
 
 
 def test_the_cli_renders_a_recency_listing(store, capsys, tmp_path):

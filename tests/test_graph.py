@@ -3,7 +3,7 @@
 import pytest
 
 import reference
-from seshat.store import CycleError, SeshatError
+from seshat.store import CycleError, SeshatError, Store
 
 
 def edge_pairs(store):
@@ -205,3 +205,98 @@ def test_a_partly_bad_edge_list_writes_nothing(store, mk):
             {"id": b, "retained": 0.5, "reason": "typo'd key"},
         ])
     assert store.db.execute("SELECT COUNT(*) FROM supersession").fetchone()[0] == before
+
+
+def test_a_non_numeric_retained_reports_what_is_wrong(tmp_path):
+    """`float("high")` raises ValueError and `float(None)` raises TypeError, and
+    neither is a SeshatError -- so both walked past `reported` and reached the
+    model as "error executing tool", which says only to give up. The message
+    that names the mistake is the whole point of that decorator."""
+    store = Store(":memory:")
+    first, _ = store.create_note("first", "body")
+
+    for value in ("high", None, [0.5], {}):
+        with pytest.raises(SeshatError, match="retained"):
+            store.create_note("n", "t", [{"id": first, "retained": value}])
+
+    assert store.db.execute("SELECT COUNT(*) FROM note").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_retained_is_refused(value):
+    """NaN passes `0.0 <= x <= 1.0` by being false on both sides of nothing,
+    and would sit in a REAL column poisoning every MAX() over it."""
+    store = Store(":memory:")
+    first, _ = store.create_note("first", "body")
+    with pytest.raises(SeshatError, match="retained"):
+        store.create_note("n", "t", [{"id": first, "retained": value}])
+
+
+def test_an_integrity_error_that_is_not_a_collision_is_not_retried():
+    """The timestamp loop exists for one thing: the same edge re-assessed twice
+    inside one microsecond. Any other IntegrityError is not fixed by moving the
+    timestamp, so retrying spins forever on a write that will never succeed.
+
+    The failure is injected through a forwarding proxy rather than a patched
+    method, because sqlite3.Connection.execute is read-only -- and a real
+    non-collision IntegrityError cannot be provoked here: `_check_retained`
+    catches the CHECK case before the insert and `resolve` guarantees both
+    foreign keys exist.
+    """
+    import sqlite3
+
+    class Interposed:
+        """Forwards to the real connection, failing one statement."""
+
+        def __init__(self, real):
+            self._real = real
+            self.attempts = 0
+
+        def execute(self, sql, *args):
+            if "INSERT INTO assessment" in sql:
+                self.attempts += 1
+                raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+            return self._real.execute(sql, *args)
+
+        def __enter__(self):
+            return self._real.__enter__()
+
+        def __exit__(self, *exc):
+            return self._real.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    store = Store(":memory:")
+    a, _ = store.create_note("a", "body a")
+    b, _ = store.create_note("b", "body b")
+
+    proxy = Interposed(store.db)
+    store.db = proxy
+    with pytest.raises(sqlite3.IntegrityError):
+        store.add_assessment(a, b, 0.5)
+    assert proxy.attempts == 1, "a non-collision failure must not be retried at all"
+
+
+def test_a_real_timestamp_collision_is_still_absorbed():
+    """The loop must keep doing its job: two assessments of one edge inside a
+    microsecond are two facts, and neither may be lost."""
+    store = Store(":memory:")
+    a, _ = store.create_note("a", "body a")
+    b, _ = store.create_note("b", "body b")
+
+    import seshat.store as store_module
+
+    fixed = store_module.now()
+    original = store_module.now
+    store_module.now = lambda: fixed
+    try:
+        store.add_assessment(a, b, 0.5, "first")
+        store.add_assessment(a, b, 0.7, "second")
+    finally:
+        store_module.now = original
+
+    rows = store.db.execute(
+        "SELECT retained, rationale FROM assessment ORDER BY asserted_at"
+    ).fetchall()
+    assert [(r["retained"], r["rationale"]) for r in rows] == [(0.5, "first"), (0.7, "second")]

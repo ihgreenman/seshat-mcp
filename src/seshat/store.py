@@ -593,7 +593,11 @@ class Store:
         ).fetchone()
 
         stamp = now()
-        while True:
+        # Bounded, and narrowed to the collision it exists for. Any other
+        # IntegrityError -- a failed CHECK, a foreign key -- is not fixed by
+        # moving the timestamp, so retrying it spins forever on a write that
+        # will never succeed.
+        for _ in range(_STAMP_COLLISION_RETRIES):
             try:
                 with self.db:
                     self.db.execute(
@@ -602,9 +606,16 @@ class Store:
                         (old.id, new.id, retained, why, stamp),
                     )
                 break
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
+                if "assessment.asserted_at" not in str(exc) and "UNIQUE" not in str(exc):
+                    raise
                 # Same edge, same microsecond. Nudge forward rather than lose one.
                 stamp = _tick(stamp)
+        else:
+            raise SeshatError(
+                f"could not record an assessment of {old.id} -> {new.id}: "
+                f"{_STAMP_COLLISION_RETRIES} consecutive timestamp collisions"
+            )
 
         return {
             "old_id": old.id,
@@ -1119,10 +1130,34 @@ def _check_since(since: str | None) -> str | None:
 
 
 def _check_retained(value: Any) -> float:
-    retained = float(value)
+    """Coerce and range-check `retained`, as a SeshatError either way.
+
+    `float("high")` raises ValueError and `float(None)` raises TypeError, and
+    neither is a SeshatError -- so they walked straight past `reported` and
+    reached the model as "error executing tool", which says only to give up.
+    The message that names the mistake is the whole point of that decorator.
+    """
+    try:
+        retained = float(value)
+    except (TypeError, ValueError):
+        raise SeshatError(
+            f"retained must be a number in [0, 1]; got {value!r}. It is the "
+            f"fraction of the OLD note that survives -- 1.0 keeps all of it, "
+            f"0.0 retracts it."
+        ) from None
+    if retained != retained or retained in (float("inf"), float("-inf")):
+        raise SeshatError(f"retained must be a finite number in [0, 1], got {retained}")
     if not 0.0 <= retained <= 1.0:
         raise SeshatError(f"retained must be in [0, 1], got {retained}")
     return retained
+
+
+_STAMP_COLLISION_RETRIES = 1000
+"""How many microseconds `add_assessment` will step forward past a collision.
+
+Only reached when the same edge is re-assessed repeatedly inside one
+microsecond, so any bound comfortably above 1 is arbitrary; what matters is
+that there is one."""
 
 
 def _tick(stamp: str) -> str:
