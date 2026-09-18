@@ -77,6 +77,19 @@ seshat reset                # archive an unopenable store and start fresh
 over notes, chains and captured sources, plus a queue of captures that need a
 human. `--help` lists the rest.
 
+It binds `127.0.0.1` and has **no authentication** — the bind address is the
+only access control it has, so it is loopback-only and there is no switch that
+changes that:
+
+```sh
+seshat review --host ::1      # fine: still loopback
+seshat review --host 0.0.0.0  # refused, before anything opens
+```
+
+`--host` picks among loopback addresses and nothing more. If you want to reach
+it from another machine, put a reverse proxy in front — it can authenticate and
+terminate TLS, which this interface cannot.
+
 ## Four things that will surprise you
 
 1. **There is no delete, and no edit.** Correct a note by writing a new one that
@@ -84,7 +97,11 @@ human. `--help` lists the rest.
 2. **Writing a note fetches the URLs in it.** Once, in the background, so you
    still have the page later when it has moved or died. That means a write makes
    outbound requests — `--no-snapshots` turns it off, at the cost of never being
-   able to capture those links again.
+   able to capture those links again. Only public addresses are fetched:
+   loopback, link-local, private and reserved ranges are refused, re-checked
+   after every redirect, with no flag to allow them. A note is not a way to make
+   your machine fetch things inside your network. If you genuinely want a
+   private page preserved, paste it in triage.
 3. **`context` searches content, not identifiers.** A note's id is in no index,
    so searching one finds notes that *mention* it, never the note itself. Use
    `read` for that; it recovers from a single mistyped word.

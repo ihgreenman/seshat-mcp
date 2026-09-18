@@ -127,6 +127,44 @@ Three things are enforced rather than intended:
   so rather than quietly returning worse results. The process also runs its own
   embedding worker, because an extension capture writes a note *here*, not in
   the MCP server, and would otherwise sit unembedded until something else ran.
+- **`--host` chooses among loopback addresses; nothing widens the bind.** The
+  refusal takes no override parameter, which is the design rather than an
+  omission — `check_bind(host, port)` has no third argument to pass. Loopback is
+  decided by resolving the host, not by matching literals, and anything
+  unresolvable counts as remote. The refusal runs before `Review` is
+  constructed: `Review` writes the API token file, and a refusal that drops a
+  secret on disk is not a refusal.
+- **The gate is on the resolved address, not on the flags.** A test enumerates
+  every switch combination the CLI accepts and asserts each still refuses
+  `0.0.0.0`; more usefully, adding a hostile `--public` flag that sets the host
+  to `0.0.0.0` changes nothing, because the check happens where the socket is
+  opened rather than where the argument is parsed. A guard placed at the
+  argument would have to be re-applied at every new argument.
+- **`check_bind` is a pure function, separately from serving.** Found by
+  mutation: with the gate inlined in `serve_review`, defanging it made the
+  suite *hang* rather than fail, because the refusal tests fell through into a
+  real bind that serves forever. A safety check whose only test path opens a
+  socket fails in the one mode a safety check must not have.
+- **`ThreadingHTTPServer` is `AF_INET`**, so the old localhost whitelist
+  accepted `::1` and could never have bound it. The family is now chosen from
+  the resolved address.
+- **Capture targets are restricted to public addresses.** `refuse_target`
+  resolves the host and refuses loopback, link-local, private, reserved,
+  multicast and CGNAT space, re-applied at every redirect hop rather than only
+  at the entry URL — a public URL that 302s to 169.254.169.254 is the standard
+  way past a naive filter. No override, matching §10's rule on the bind address
+  pointed outward: note text is often written by a model summarising a page it
+  just read, so without this a note is a request-forgery primitive aimed at
+  whatever network the machine can see. A refused target records `unreachable`
+  with the reason and lands in triage, where §10.2's paste path already handles
+  it without seshat ever touching the private network.
+
+  Two limits, recorded rather than implied. The name is resolved by the check
+  and again by the connection, so a DNS answer that changes in between is not
+  caught; closing that needs a pinned-address connection with an explicit Host
+  header, which is disproportionate here. And **this is not in the spec yet** —
+  §6.6 describes capture-at-write without saying what may be fetched. It should
+  say so in 1.5.
 - **POSTs are origin-checked and token-guarded.** "localhost is safe" stops
   being true the moment a browser is a client — any page you visit can post to
   127.0.0.1. §10.2 names this for the extension; it applies the instant a
